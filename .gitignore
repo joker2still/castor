@@ -10,3 +10,11 @@ build/
 logs/
 memory/
 .vault_key
+.env
+.env.*
+.idea/
+.vscode/
+*.log
+.DS_Store
+config.local.py
+uploads/
