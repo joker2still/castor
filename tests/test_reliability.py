@@ -1,0 +1,42 @@
+"""Tests for reliability features: retry loop and self-check.
+
+Uses the real agent module. No module-level sys.modules mutation — the
+per-test fixtures below supply what's needed through monkeypatch.
+"""
+
+import pytest
+
+
+@pytest.fixture
+def agent_mod():
+    """Import the real agent module (no mocks needed for these assertions)."""
+    import agent
+    return agent
+
+
+def test_get_tool_schema_known(agent_mod):
+    schema = agent_mod._get_tool_schema("shell")
+    assert schema is not None
+    assert "command" in schema.get("properties", {})
+
+
+def test_get_tool_schema_unknown(agent_mod):
+    schema = agent_mod._get_tool_schema("nonexistent_tool")
+    assert schema is None
+
+
+def test_repair_json_trailing_comma(agent_mod):
+    result = agent_mod._repair_json('{"command": "ls",}')
+    assert result == {"command": "ls"}
+
+
+def test_repair_json_empty(agent_mod):
+    result = agent_mod._repair_json("")
+    assert result == {}
+
+
+def test_turn_result_has_reliability_fields(agent_mod):
+    r = agent_mod.TurnResult()
+    assert r.json_repairs == 0
+    assert r.retry_successes == 0
+    assert r.self_check_fixes == 0

@@ -1,0 +1,289 @@
+"""Thread/session management — isolated conversations with shared memory.
+
+Each thread has its own message history. Memory (Qdrant) and soul are shared.
+
+Usage:
+    import threads
+    t = threads.create("research project")
+    threads.switch(t["id"])
+    current = threads.get_active_id()   # used by db and agent
+    threads.list_all()
+"""
+
+import time
+import json
+import db
+import logger
+
+_log = logger.get("threads")
+
+
+_active_id: str | None = None
+
+DEFAULT_THREAD_ID = "default"
+DEFAULT_THREAD_NAME = "Main"
+
+
+def _ensure_table():
+    """Create threads table if not exists + migrate messages."""
+    conn = db._get_conn()
+
+
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS threads (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            archived INTEGER DEFAULT 0,
+            meta TEXT DEFAULT '{}'
+        );
+    """)
+
+
+    try:
+        conn.execute("SELECT thread_id FROM messages LIMIT 1")
+    except Exception:
+        conn.execute(f"ALTER TABLE messages ADD COLUMN thread_id TEXT DEFAULT '{DEFAULT_THREAD_ID}'")
+        _log.info("migrated messages table: added thread_id column")
+
+
+    row = conn.execute("SELECT id FROM threads WHERE id=?", (DEFAULT_THREAD_ID,)).fetchone()
+    if not row:
+        conn.execute(
+            "INSERT INTO threads (id, name, created_at, updated_at) VALUES (?,?,?,?)",
+            (DEFAULT_THREAD_ID, DEFAULT_THREAD_NAME, time.time(), time.time())
+        )
+    conn.commit()
+
+
+def _gen_id() -> str:
+    """Generate a unique thread id: t_<timestamp_hex><random>"""
+    import random
+    ts = int(time.time() * 1000) % 0xFFFFFFFF
+    rnd = random.randint(0, 0xFFF)
+    return f"t_{ts:08x}{rnd:03x}"
+
+
+def create(name: str, meta: dict | None = None, source: str = "other") -> dict:
+    """Create a new thread. Returns thread dict.
+
+    `source` identifies which surface initiated the creation, for the
+    opt-in `thread_created` telemetry event. Closed-enum values:
+    web / cli / telegram / scheduler / preset / other. Anything else
+    coerces to "other" inside the telemetry helper. The thread name +
+    meta are NEVER part of the event — only the source.
+    """
+    _ensure_table()
+    tid = _gen_id()
+    now = time.time()
+    db.execute(
+        "INSERT INTO threads (id, name, created_at, updated_at, meta) VALUES (?,?,?,?,?)",
+        (tid, name, now, now, json.dumps(meta or {}))
+    )
+    _log.info(f"thread created: {tid} '{name}' [source={source}]")
+    _emit_thread_created_telemetry(source)
+    return {"id": tid, "name": name, "created_at": now, "updated_at": now, "archived": False, "messages": 0}
+
+
+def _emit_thread_created_telemetry(source: str) -> None:
+    """Lazy-imported telemetry emit. No-op when telemetry is disabled
+    or anything goes wrong — this must NEVER raise into the caller's
+    happy path."""
+    try:
+        import telemetry
+        if not telemetry.enabled():
+            return
+        safe = source if source in telemetry.SOURCES else "other"
+        telemetry.track_event("thread_created", {"source": safe})
+    except Exception:
+        # Belt and suspenders — telemetry must never break thread creation
+        _log.debug("thread_created telemetry emit failed", exc_info=True)
+
+
+def get(tid: str) -> dict | None:
+    """Get thread by id."""
+    _ensure_table()
+    row = db.fetchone(
+        "SELECT id, name, created_at, updated_at, archived, meta FROM threads WHERE id=?",
+        (tid,)
+    )
+    if not row:
+        return None
+    msg_count = db.fetchone(
+        "SELECT COUNT(*) FROM messages WHERE thread_id=?", (tid,)
+    )[0]
+    return {
+        "id": row[0], "name": row[1], "created_at": row[2], "updated_at": row[3],
+        "archived": bool(row[4]), "meta": json.loads(row[5] or "{}"), "messages": msg_count,
+    }
+
+
+def list_all(include_archived: bool = False) -> list[dict]:
+    """List all threads, sorted by last activity."""
+    _ensure_table()
+
+    where = "" if include_archived else "WHERE t.archived=0"
+    q = f"""
+        SELECT t.id, t.name, t.created_at, t.updated_at, t.archived, t.meta,
+               COALESCE(mc.cnt, 0) AS msg_count,
+               lm.content AS last_preview
+        FROM threads t
+        LEFT JOIN (SELECT thread_id, COUNT(*) AS cnt FROM messages GROUP BY thread_id) mc
+            ON mc.thread_id = t.id
+        LEFT JOIN (
+            SELECT thread_id, content,
+                   ROW_NUMBER() OVER (PARTITION BY thread_id ORDER BY id DESC) AS rn
+            FROM messages WHERE role='user'
+        ) lm ON lm.thread_id = t.id AND lm.rn = 1
+        {where}
+        ORDER BY CASE WHEN t.id='default' THEN 0 ELSE 1 END, t.updated_at DESC
+    """
+    rows = db.fetchall(q)
+
+    active = get_active_id()
+    result = []
+    for tid, name, created, updated, archived, meta_raw, msg_count, preview_raw in rows:
+        preview = preview_raw or ""
+        if len(preview) > 60:
+            preview = preview[:60] + "..."
+        result.append({
+            "id": tid, "name": name, "created_at": created, "updated_at": updated,
+            "archived": bool(archived), "messages": msg_count, "preview": preview,
+            "active": tid == active, "meta": json.loads(meta_raw or "{}"),
+        })
+    return result
+
+
+def rename(tid: str, name: str) -> str:
+    """Rename a thread."""
+    _ensure_table()
+    db.execute("UPDATE threads SET name=?, updated_at=? WHERE id=?", (name, time.time(), tid))
+    _log.info(f"thread renamed: {tid} → '{name}'")
+    return f"✓ Renamed to '{name}'"
+
+
+def set_folder(tid: str, folder: str | None) -> dict:
+    """Move a thread into a folder (string name) or ungroup (None / "").
+
+    Folders are stored inside ``threads.meta.folder`` — no separate
+    schema. The folder list in the UI is derived from ``DISTINCT
+    meta.folder`` across all threads. Empty string / None clears the
+    folder membership so the thread renders in the ungrouped section.
+    """
+    _ensure_table()
+    row = db.fetchone("SELECT meta FROM threads WHERE id=?", (tid,))
+    if not row:
+        return {"error": f"thread {tid} not found"}
+    meta = {}
+    try:
+        meta = json.loads(row[0] or "{}")
+    except Exception:
+        meta = {}
+    clean = (folder or "").strip()
+    if clean:
+        meta["folder"] = clean[:60]
+    else:
+        meta.pop("folder", None)
+    db.execute(
+        "UPDATE threads SET meta=?, updated_at=? WHERE id=?",
+        (json.dumps(meta), time.time(), tid),
+    )
+    _log.info(f"thread {tid}: folder → {meta.get('folder') or '(none)'}")
+    return {"ok": True, "folder": meta.get("folder", "")}
+
+
+def list_folders() -> list[str]:
+    """Return distinct non-empty folder names across all non-archived threads."""
+    _ensure_table()
+    rows = db.fetchall("SELECT meta FROM threads WHERE archived=0")
+    names = set()
+    for (meta_raw,) in rows:
+        try:
+            m = json.loads(meta_raw or "{}")
+            f = (m.get("folder") or "").strip()
+            if f:
+                names.add(f)
+        except Exception:
+            pass
+    return sorted(names, key=str.lower)
+
+
+def archive(tid: str) -> str:
+    """Archive a thread (hide from default list)."""
+    _ensure_table()
+    if tid == DEFAULT_THREAD_ID:
+        return "✗ Can't archive the default thread"
+    db.execute("UPDATE threads SET archived=1, updated_at=? WHERE id=?", (time.time(), tid))
+
+
+    if tid == get_active_id():
+        switch(DEFAULT_THREAD_ID)
+
+    _log.info(f"thread archived: {tid}")
+    return f"✓ Thread archived"
+
+
+def delete(tid: str) -> str:
+    """Delete a thread, its messages, and any routine bound to it.
+
+    Routines are bound 1:1 to their thread (migration 004). Deleting the
+    thread without also removing the routine would leave the routine
+    firing into a non-existent thread forever — the user's "delete thread
+    = delete routine" request closes that loop symmetrically with
+    ``scheduler.remove`` (which already deletes the thread).
+    """
+    _ensure_table()
+    if tid == DEFAULT_THREAD_ID:
+        return "✗ Can't delete the default thread"
+
+
+    try:
+        import scheduler as _sched
+        n = _sched.remove_by_thread(tid)
+        if n:
+            _log.info(f"thread delete cascaded to {n} routine(s)")
+    except Exception as e:
+        _log.debug(f"routine cascade skipped for thread {tid}: {e}")
+
+    db.execute("DELETE FROM messages WHERE thread_id=?", (tid,))
+    db.execute("DELETE FROM threads WHERE id=?", (tid,))
+
+    if tid == get_active_id():
+        switch(DEFAULT_THREAD_ID)
+
+    _log.info(f"thread deleted: {tid}")
+    return f"✓ Thread deleted"
+
+
+def get_active_id() -> str:
+    """Get active thread id."""
+    global _active_id
+    if _active_id is None:
+        _ensure_table()
+        _active_id = db.kv_get("active_thread") or DEFAULT_THREAD_ID
+    return _active_id
+
+
+def switch(tid: str) -> str:
+    """Switch to a different thread."""
+    global _active_id
+    _ensure_table()
+
+
+    row = db.fetchone("SELECT name FROM threads WHERE id=?", (tid,))
+    if not row:
+        return f"✗ Thread '{tid}' not found"
+
+    old = get_active_id()
+    _active_id = tid
+    db.kv_set("active_thread", tid)
+    _log.info(f"thread switched: {old} → {tid} ('{row[0]}')")
+    return f"✓ Switched to '{row[0]}'"
+
+
+def touch(tid: str | None = None):
+    """Update thread's updated_at timestamp."""
+    tid = tid or get_active_id()
+    _ensure_table()
+    db.execute("UPDATE threads SET updated_at=? WHERE id=?", (time.time(), tid))

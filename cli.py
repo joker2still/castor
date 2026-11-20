@@ -1,0 +1,2196 @@
+#!/usr/bin/env python3
+"""castor CLI — lightweight AI agent for local models."""
+
+import os
+import sys
+import threading
+from rich.console import Console
+from rich.markdown import Markdown
+from rich.panel import Panel
+from rich.live import Live
+import agent
+import config
+import db
+import soul
+import skills
+import tasks
+import scheduler
+import providers
+import threads
+import logger
+
+_log = logger.get("cli")
+
+console = Console()
+
+
+try:
+    import readline
+    for _binding in (
+        '"\\e[A": previous-history',
+        '"\\e[B": next-history',
+        '"\\e[C": forward-char',
+        '"\\e[D": backward-char',
+    ):
+        try:
+            readline.parse_and_bind(_binding)
+        except Exception:
+            # pyreadline3 (Windows) raises IndexError on \e[X keydescr — ignore
+            pass
+except ImportError:
+    pass
+
+LOGO = """[bold yellow]
+   ██████╗ ██╗    ██╗███████╗     ██████╗ ██╗    ██╗███████╗
+  ██╔═══██╗██║    ██║██╔════╝    ██╔═══██╗██║    ██║██╔════╝
+  ██║   ██║██║ █╗ ██║█████╗█████╗██║   ██║██║ █╗ ██║█████╗
+  ██║▄▄ ██║██║███╗██║██╔══╝╚════╝██║▄▄ ██║██║███╗██║██╔══╝
+  ╚██████╔╝╚███╔███╔╝███████╗    ╚██████╔╝╚███╔███╔╝███████╗
+   ╚══▀▀═╝  ╚══╝╚══╝ ╚══════╝     ╚══▀▀═╝  ╚══╝╚══╝ ╚══════╝[/]"""
+
+
+def _status_line() -> str:
+    s = soul.load()
+    s_prompt = int(db.kv_get("session_prompt_tokens") or "0")
+    s_compl = int(db.kv_get("session_completion_tokens") or "0")
+    s_total = s_prompt + s_compl
+    s_turns = db.kv_get("session_turns") or "0"
+    active_skills = skills.get_active()
+    sk = f" | skills: {','.join(sorted(active_skills))}" if active_skills else ""
+    prov = providers.get_active_name()
+    model = providers.get_model()
+    tid = threads.get_active_id()
+    t = threads.get(tid)
+    thread_name = t["name"] if t else tid
+    return (
+        f"agent {s['name']} | {model} @ {prov} | "
+        f"💬 {thread_name} | tokens {s_total:,} ({s_turns} turns){sk}"
+    )
+
+
+def show_banner():
+    console.print(LOGO)
+    s = soul.load()
+    user_name = db.kv_get("user_name") or "User"
+    city = db.kv_get("timezone_city") or "somewhere"
+    mem_count = 0
+    try:
+        import memory
+        mem_count = memory.count()
+    except Exception:
+        pass
+    active = skills.get_active()
+
+    console.print(f"""
+  [dim]🦆 castor — your fully offline AI agent[/]
+  [dim]No cloud. No API keys. No subscriptions. Just your GPU.[/]
+
+  [dim]🧠 Model:[/]  {providers.get_model()} @ {providers.get_active_name()}
+  [dim]👤 User:[/]   {user_name} [dim]({city}, UTC{config.TZ_OFFSET:+d})[/]
+  [dim]🤖 Agent:[/]  {s['name']} [dim]| {s['language']}[/]
+  [dim]💾 Memory:[/] {mem_count} memories [dim]| SQLite + Qdrant[/]
+  [dim]⚙️  Skills:[/] {', '.join(sorted(active)) if active else 'none'} [dim]| /skills to manage[/]
+
+  [dim]Commands: /thread  /model  /provider  /telegram  /soul  /skills  /memory  /cron  /tasks  /stats  /logs  /clear  /quit[/]
+"""
+    )
+
+
+def show_stats():
+    s_prompt = db.kv_get("session_prompt_tokens") or "0"
+    s_compl = db.kv_get("session_completion_tokens") or "0"
+    s_turns = db.kv_get("session_turns") or "0"
+    s_total = int(s_prompt) + int(s_compl)
+    s = soul.load()
+    console.print(Panel(
+        f"[cyan]Agent:[/]       {s['name']}\n"
+        f"[cyan]Turns:[/]       {s_turns}\n"
+        f"[cyan]Tokens:[/]      ↑{s_prompt} prompt  ↓{s_compl} completion  Σ{s_total} total\n"
+        f"[cyan]Model:[/]       {providers.get_model()} ({providers.get_active_name()})\n"
+        f"[cyan]Memory:[/]      Qdrant ({agent.config.QDRANT_MODE}, {__import__('memory').count()} points)\n"
+        f"[cyan]Database:[/]    {agent.config.DB_PATH}\n"
+        f"[cyan]Data dir:[/]   {agent.config.DATA_DIR}",
+        title="[bold]📊 Session Stats[/]",
+        border_style="cyan",
+        padding=(0, 2),
+    ))
+
+
+def handle_soul_command(args: str):
+    s = soul.load()
+    if args:
+        parts = args.split(maxsplit=1)
+        if len(parts) == 2:
+            key, value = parts
+            value = value.lower().strip()
+            if value not in ("low", "moderate", "high") and key not in ("name", "language"):
+                console.print("  [red]Value must be low, moderate, or high[/]")
+                return
+            result = soul.save(key, value)
+            console.print(f"  [magenta]{result}[/]")
+        return
+
+
+    console.print()
+    console.print("  [bold magenta]🧬 Soul Editor[/]")
+    console.print("  [dim]Enter value or press Enter to keep current. q to finish.[/]\n")
+
+    for field in ("name", "language"):
+        try:
+            current = s[field]
+            new_val = console.input(f"  [cyan]{field}[/] [dim]({current})[/] > ").strip()
+            if new_val:
+                soul.save(field, new_val)
+                s[field] = new_val
+        except (EOFError, KeyboardInterrupt):
+            return
+
+    console.print()
+    level_traits = [k for k in s if k not in ("name", "language")]
+    for trait in level_traits:
+        level = s[trait]
+        low, high = soul.TRAIT_DESCRIPTIONS.get(trait, ("low", "high"))
+        console.print(f"  [bold cyan]{trait}[/] = [bold]{level}[/]  [dim]{low} ↔ {high}[/]")
+        try:
+            inp = console.input(f"  [dim]low/moderate/high (enter=keep)[/] > ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return
+        if inp == "q":
+            break
+        if inp in ("low", "moderate", "high"):
+            soul.save(trait, inp)
+            s[trait] = inp
+
+    console.print()
+    console.print(Panel(
+        soul.format_display(soul.load()),
+        title="[bold]🧬 Soul — saved[/]",
+        border_style="magenta",
+        padding=(0, 2),
+    ))
+
+
+def handle_skills_command(args: str):
+    if args:
+        parts = args.split(maxsplit=1)
+        if len(parts) == 2:
+            action, name = parts
+            if action == "on":
+                console.print(f"  [green]{skills.enable(name)}[/]")
+            elif action == "off":
+                console.print(f"  [yellow]{skills.disable(name)}[/]")
+        return
+
+
+    import readchar
+
+    all_skills = skills.list_all()
+    if not all_skills:
+        console.print("  [dim]No skills found in skills/ folder.[/]")
+        return
+
+    selected = {s["name"] for s in all_skills if s["active"]}
+    cursor = 0
+
+    def render():
+
+        if render.first:
+            render.first = False
+        else:
+
+            lines_to_clear = len(all_skills) + 3
+            sys.stdout.write(f"\033[{lines_to_clear}A\033[J")
+
+        console.print("  [bold magenta]⚡ Skills[/]  [dim]↑↓ move  space toggle  enter save[/]\n")
+        for i, s in enumerate(all_skills):
+            check = "[green]●[/]" if s["name"] in selected else "[dim]○[/]"
+            pointer = "[bold yellow]▸[/]" if i == cursor else " "
+            name_fmt = f"[bold]{s['name']}[/]" if s["name"] in selected else s["name"]
+            tools_count = f"[dim]({s['tools']} tools)[/]"
+            desc = f"[dim]— {s['description']}[/]" if s["description"] else ""
+            console.print(f"  {pointer} {check} {name_fmt} {tools_count} {desc}")
+        console.print()
+
+    render.first = True
+    render()
+
+    while True:
+        key = readchar.readkey()
+
+        if key in (readchar.key.UP, "k"):
+            cursor = (cursor - 1) % len(all_skills)
+        elif key in (readchar.key.DOWN, "j"):
+            cursor = (cursor + 1) % len(all_skills)
+        elif key == " ":
+            name = all_skills[cursor]["name"]
+            if name in selected:
+                selected.discard(name)
+            else:
+                selected.add(name)
+        elif key in (readchar.key.ENTER, "\r", "\n"):
+
+            skills.set_active(selected)
+            console.print(f"  [green]✓ Active: {', '.join(sorted(selected)) or 'none'}[/]")
+            return
+        elif key in ("q", readchar.key.ESC):
+            return
+
+        render()
+
+
+def _preset_exec(action: str, rest: str) -> dict:
+    """Run a preset subcommand. Returns a structured result dict.
+
+    Shape (varies by kind):
+        {"kind": "list",        "items": [...], "active": str|None}
+        {"kind": "install_ok",  "result": {...}}
+        {"kind": "activate_ok", "id": str, "name": str}
+        {"kind": "deactivate_ok","id": str}
+        {"kind": "deactivate_noop"}
+        {"kind": "info",        "info": {...}}
+        {"kind": "rm_ok",       "id": str}
+        {"kind": "usage",       "action": str, "usage": str}
+        {"kind": "validation",  "errors": [...]}
+        {"kind": "error",       "message": str, "exit_code": int}
+        {"kind": "unknown",     "action": str}
+    """
+    import presets as _p
+
+    if not action or action == "list":
+        return {
+            "kind": "list",
+            "items": _p.list_installed(),
+            "active": _p.get_active(),
+        }
+
+    if action == "install":
+        if not rest:
+            return {
+                "kind": "usage",
+                "action": "install",
+                "usage": "install <path-to-.qwp-or-dir-or-id>",
+            }
+        try:
+            info = _p.load_any(rest)
+            errors = _p.validate(info)
+            if errors:
+                return {"kind": "validation", "errors": errors}
+            return {"kind": "install_ok", "result": _p.install(info)}
+        except FileExistsError as e:
+            return {"kind": "error", "message": str(e), "exit_code": 1, "already": True}
+        except Exception as e:
+            return {"kind": "error", "message": f"Install failed: {e}", "exit_code": 1}
+
+    if action == "activate":
+        if not rest:
+            return {"kind": "usage", "action": "activate", "usage": "activate <id>"}
+        try:
+            r = _p.activate(rest)
+            return {"kind": "activate_ok", "id": r["id"], "name": r["name"]}
+        except Exception as e:
+            return {"kind": "error", "message": f"Activate failed: {e}", "exit_code": 1}
+
+    if action in ("deactivate", "off"):
+        current = _p.get_active()
+        if not current:
+            return {"kind": "deactivate_noop"}
+        try:
+            _p.deactivate()
+            return {"kind": "deactivate_ok", "id": current}
+        except Exception as e:
+            return {"kind": "error", "message": f"Deactivate failed: {e}", "exit_code": 1}
+
+    if action == "info":
+        if not rest:
+            return {"kind": "usage", "action": "info", "usage": "info <id>"}
+        info = _p.get_info(rest)
+        if not info:
+            return {
+                "kind": "error",
+                "message": f"Preset not installed: {rest}",
+                "exit_code": 1,
+            }
+        return {"kind": "info", "info": info}
+
+    if action in ("rm", "uninstall", "remove"):
+        if not rest:
+            return {"kind": "usage", "action": "rm", "usage": "rm <id>"}
+        try:
+            _p.uninstall(rest)
+            return {"kind": "rm_ok", "id": rest}
+        except Exception as e:
+            return {"kind": "error", "message": f"Uninstall failed: {e}", "exit_code": 1}
+
+    if action == "trust":
+        return _preset_trust(rest, _p)
+
+    if action == "policy":
+        if not rest:
+            return {"kind": "policy_show", "policy": _p.get_signature_policy()}
+        try:
+            _p.set_signature_policy(rest.strip())
+            return {"kind": "policy_set", "policy": rest.strip()}
+        except Exception as e:
+            return {"kind": "error", "message": str(e), "exit_code": 2}
+
+    return {"kind": "unknown", "action": action}
+
+
+def _preset_trust(rest: str, _p) -> dict:
+    """Handle `/preset trust <subcommand>`."""
+    from pathlib import Path
+    import shlex
+    import os as _os
+
+
+    try:
+        tokens = shlex.split(rest, posix=(_os.name != "nt"))
+    except ValueError:
+        tokens = rest.split()
+    sub = tokens[0] if tokens else "list"
+    arg = tokens[1] if len(tokens) > 1 else ""
+
+    if sub == "list":
+        pems = _p.get_trusted_pubkeys()
+        return {
+            "kind": "trust_list",
+            "keys": [
+                {"fingerprint": _p.pubkey_fingerprint(pem), "pem": pem}
+                for pem in pems
+            ],
+        }
+
+    if sub == "add":
+        if not arg:
+            return {"kind": "usage", "action": "trust add", "usage": "trust add <path-to-pub.pem>"}
+        p = Path(arg).expanduser()
+        if not p.is_file():
+            return {"kind": "error", "message": f"public key not found: {p}", "exit_code": 1}
+        try:
+            pem = p.read_text(encoding="utf-8")
+            fp = _p.add_trusted_pubkey(pem)
+            return {"kind": "trust_added", "fingerprint": fp, "path": str(p)}
+        except Exception as e:
+            return {"kind": "error", "message": f"Add failed: {e}", "exit_code": 1}
+
+    if sub in ("rm", "remove"):
+        if not arg:
+            return {"kind": "usage", "action": "trust rm", "usage": "trust rm <fingerprint-prefix>"}
+        if _p.remove_trusted_pubkey(arg.strip()):
+            return {"kind": "trust_removed", "fingerprint": arg.strip()}
+        return {"kind": "error", "message": f"no trusted key matching {arg!r}", "exit_code": 1}
+
+    return {"kind": "unknown", "action": f"trust {sub}"}
+
+
+def handle_preset_command(args: str):
+    """`/preset` slash command dispatcher — rich rendering.
+
+    Subcommands:
+        /preset                      — list installed + active
+        /preset install <src>        — install from .qwp/dir/id
+        /preset activate <id>
+        /preset deactivate
+        /preset info <id>
+        /preset rm <id>              — uninstall
+    """
+    parts = args.split(maxsplit=1)
+    sub = parts[0] if parts else ""
+    rest = parts[1] if len(parts) > 1 else ""
+
+    result = _preset_exec(sub, rest)
+    kind = result["kind"]
+
+    if kind == "list":
+        items = result["items"]
+        if not items:
+            console.print("  [dim]No presets installed.[/]")
+            if os.environ.get("CASTOR_MARKET_PATH"):
+                console.print(f"  [dim]CASTOR_MARKET_PATH = {os.environ['CASTOR_MARKET_PATH']}[/]")
+                console.print("  [dim]Install via: /preset install <id>[/]")
+            else:
+                console.print("  [dim]Install via: /preset install <path-to-.qwp>[/]")
+            return
+        console.print(f"  [bold magenta]🏪 Installed presets[/]  [dim]({len(items)} total)[/]\n")
+        for it in items:
+            marker = "[green]●[/]" if it["active"] else "[dim]○[/]"
+            lic = f"[dim]{it['license_type']}[/]"
+            cat = f"[cyan]{it['category']}[/]"
+            name = f"[bold]{it['name']}[/]" if it["active"] else it["name"]
+            console.print(f"  {marker} {name} [dim]v{it['version']}[/] · {cat} · {lic}")
+            console.print(f"      [dim]{it['id']} — {it['author_name']}[/]")
+        if result["active"]:
+            console.print(f"\n  [green]Active:[/] {result['active']}")
+        return
+
+    if kind == "install_ok":
+        r = result["result"]
+        console.print(
+            f"  [green]✓ Installed[/] [bold]{r['name']}[/] "
+            f"[dim]v{r['version']} · {r['category']}[/]"
+        )
+        console.print(f"  [dim]{r['path']}[/]")
+        return
+
+    if kind == "validation":
+        console.print("  [red]✗ Validation failed:[/]")
+        for err in result["errors"]:
+            console.print(f"    [red]-[/] {err}")
+        return
+
+    if kind == "activate_ok":
+        console.print(f"  [green]✓ Activated:[/] [bold]{result['id']}[/]")
+        console.print("  [dim]Soul, skills and knowledge are now driven by this preset.[/]")
+        console.print("  [dim]Run /preset deactivate to restore your previous soul.[/]")
+        return
+
+    if kind == "deactivate_ok":
+        console.print(f"  [yellow]✓ Deactivated:[/] {result['id']}")
+        console.print("  [dim]Original soul restored.[/]")
+        return
+
+    if kind == "deactivate_noop":
+        console.print("  [dim]No preset active.[/]")
+        return
+
+    if kind == "info":
+        info = result["info"]
+        m = info["manifest"]
+        console.print(f"  [bold]{info['name']}[/] [dim]v{info['version']}[/]")
+        console.print(f"  [dim]id:[/] {info['id']}")
+        console.print(f"  [dim]category:[/] {info['category']}")
+        console.print(f"  [dim]author:[/] {info['author_name']}")
+        console.print(f"  [dim]license:[/] {info['license_type']}")
+        desc = (m.get("description") or {}).get("short", "")
+        if desc:
+            console.print(f"  [dim]desc:[/] {desc}")
+        skills_block = m.get("skills") or {}
+        custom_skills = skills_block.get("custom") or []
+        if custom_skills:
+            console.print(f"  [dim]skills:[/] {', '.join(s['name'] for s in custom_skills)}")
+        kn = m.get("knowledge") or []
+        if kn:
+            console.print(f"  [dim]knowledge:[/] {len(kn)} file(s)")
+        if info["active"]:
+            console.print("  [green]● currently active[/]")
+        return
+
+    if kind == "rm_ok":
+        console.print(f"  [yellow]✓ Uninstalled:[/] {result['id']}")
+        return
+
+    if kind == "usage":
+        console.print(f"  [dim]Usage: /preset {result['usage']}[/]")
+        return
+
+    if kind == "error":
+        if result.get("already"):
+            console.print(f"  [yellow]{result['message']}[/]")
+        else:
+            console.print(f"  [red]✗ {result['message']}[/]")
+        return
+
+    if kind == "trust_list":
+        keys = result["keys"]
+        if not keys:
+            console.print("  [dim]Trust store is empty.[/]")
+            console.print("  [dim]Add a key: /preset trust add <path-to-pub.pem>[/]")
+            return
+        console.print(f"  [bold magenta]Trusted signing keys[/]  [dim]({len(keys)} total)[/]\n")
+        for k in keys:
+            console.print(f"  [green]●[/] [mono]{k['fingerprint']}[/]")
+        return
+
+    if kind == "trust_added":
+        console.print(f"  [green]✓ Trusted[/] {result['fingerprint']}")
+        console.print(f"  [dim]{result['path']}[/]")
+        return
+
+    if kind == "trust_removed":
+        console.print(f"  [yellow]✓ Removed[/] {result['fingerprint']}")
+        return
+
+    if kind == "policy_show":
+        console.print(f"  [dim]signature policy:[/] [bold]{result['policy']}[/]")
+        console.print("  [dim]Values: off | warn | require[/]")
+        return
+
+    if kind == "policy_set":
+        console.print(f"  [green]✓ Signature policy:[/] [bold]{result['policy']}[/]")
+        return
+
+    if kind == "unknown":
+        console.print(f"  [dim]Unknown: /preset {result['action']}[/]")
+        console.print("  [dim]Subcommands: list, install, activate, deactivate, info, rm, trust, policy[/]")
+        return
+
+    # Fallback — new result kinds must be added to both formatters.
+    console.print(f"  [red]⚠ Unhandled preset result kind: {kind}[/]")
+    console.print(f"  [dim]{result}[/]")
+
+
+def handle_cron(args: str):
+    if args.startswith("rm "):
+        try:
+            task_id = int(args[3:].strip())
+            console.print(f"  {scheduler.remove(task_id)}")
+        except ValueError:
+            console.print("  [dim]Usage: /cron rm <id>[/]")
+        return
+
+    tasks_list = scheduler.list_tasks()
+    if not tasks_list:
+        console.print("  [dim]No scheduled tasks. Agent can create them with schedule_task tool.[/]")
+        return
+    for t in tasks_list:
+        status = "[green]●[/]" if t["enabled"] else "[dim]○[/]"
+        repeat = "🔄" if t["repeat"] else "⏱"
+        console.print(f"  {status} #{t['id']} {repeat} [bold]{t['name']}[/] → {t['next_run']} [dim]({t['schedule']})[/]")
+        console.print(f"      [dim]{t['task'][:80]}[/]")
+    console.print(f"\n  [dim]/cron rm <id> to remove[/]")
+
+
+def show_tasks():
+    results = tasks.get_results(clear=False)
+    pending = tasks.pending_count()
+    if not results and pending == 0:
+        console.print("  [dim]No tasks.[/]")
+        return
+    if pending:
+        console.print(f"  [yellow]⏳ {pending} task(s) running...[/]")
+    for r in results:
+        icon = "[green]✅[/]" if r["status"] == "done" else "[red]❌[/]"
+        console.print(f"  {icon} #{r['id']} {r['task'][:50]}")
+        console.print(f"      [dim]{r['result'][:100]}[/]")
+
+
+def _check_background_tasks():
+    """Show completed background tasks."""
+    results = tasks.get_results(clear=True)
+    for r in results:
+        icon = "✅" if r["status"] == "done" else "❌"
+        console.print(f"\n  [bold]{icon} Task #{r['id']}:[/] {r['task'][:60]}")
+        console.print(f"  [dim]{r['result'][:200]}[/]\n")
+
+
+def handle_thread(args: str):
+    """Thread management.
+    /thread              — list all threads
+    /thread new <name>   — create new thread and switch to it
+    /thread <id>         — switch to thread
+    /thread rename <name> — rename current thread
+    /thread archive      — archive current thread
+    /thread delete <id>  — delete a thread
+    """
+    if not args:
+
+        all_t = threads.list_all()
+        if not all_t:
+            console.print("  [dim]No threads yet.[/]")
+            return
+
+        console.print(f"\n  [bold]💬 Threads:[/]\n")
+        for t in all_t:
+            marker = "[green]●[/]" if t["active"] else "[dim]○[/]"
+            msgs = f"[dim]({t['messages']} msgs)[/]"
+            preview = f" [dim]— {t['preview']}[/]" if t["preview"] else ""
+            console.print(f"    {marker} [bold]{t['id']}[/] {t['name']} {msgs}{preview}")
+        console.print(f"\n  [dim]/thread new <name>  /thread <id>  /thread rename <name>  /thread archive[/]\n")
+        return
+
+    parts = args.split(maxsplit=1)
+    cmd = parts[0]
+
+
+    if cmd == "new":
+        name = parts[1] if len(parts) > 1 else f"Thread {len(threads.list_all()) + 1}"
+        t = threads.create(name, source="cli")
+        threads.switch(t["id"])
+        console.print(f"  [green]✓ Created & switched to '{name}' ({t['id']})[/]")
+        return
+
+
+    if cmd == "rename":
+        if len(parts) < 2:
+            console.print("  [dim]Usage: /thread rename <new name>[/]")
+            return
+        result = threads.rename(threads.get_active_id(), parts[1])
+        console.print(f"  [green]{result}[/]")
+        return
+
+
+    if cmd == "archive":
+        tid = parts[1] if len(parts) > 1 else threads.get_active_id()
+        result = threads.archive(tid)
+        console.print(f"  [yellow]{result}[/]")
+        return
+
+
+    if cmd == "delete":
+        if len(parts) < 2:
+            console.print("  [dim]Usage: /thread delete <id>[/]")
+            return
+        tid = parts[1]
+        console.print(f"  [yellow]Delete thread {tid} and all messages? (y/n)[/]")
+        try:
+            confirm = input("  > ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return
+        if confirm == "y":
+            result = threads.delete(tid)
+            console.print(f"  [red]{result}[/]")
+        return
+
+
+    result = threads.switch(cmd)
+    if result.startswith("✓"):
+        console.print(f"  [green]{result}[/]")
+    else:
+        console.print(f"  [red]{result}[/]")
+
+
+def handle_model(args: str):
+    """Switch model or list available. Usage: /model [name] or /model list"""
+    if not args or args == "list":
+
+        current = providers.get_model()
+        prov_name = providers.get_active_name()
+        console.print(f"\n  [bold]🧠 Current model:[/] [cyan]{current}[/] [dim]({prov_name})[/]\n")
+
+        console.print(f"  [dim]Fetching models from {prov_name}...[/]")
+        models = providers.fetch_models()
+        if models:
+            console.print(f"  [bold]Available ({len(models)}):[/]")
+            for m in models:
+                marker = "[green]●[/]" if m == current else "[dim]○[/]"
+                console.print(f"    {marker} {m}")
+        else:
+
+            p = providers.get_provider()
+            if p.get("models"):
+                console.print(f"  [bold]Preset models:[/]")
+                for m in p["models"]:
+                    marker = "[green]●[/]" if m == current else "[dim]○[/]"
+                    console.print(f"    {marker} {m}")
+            else:
+                console.print(f"  [dim]No models found. Is the server running?[/]")
+        console.print(f"\n  [dim]Usage: /model <name>[/]\n")
+        return
+
+    result = providers.set_model(args)
+    console.print(f"  [green]{result}[/]")
+
+
+def handle_provider(args: str):
+    """Manage providers. Usage: /provider [name] [key <key>] [url <url>]"""
+    if not args or args == "list":
+
+        all_p = providers.list_all()
+        console.print(f"\n  [bold]🔌 Providers:[/]\n")
+        for p in all_p:
+            marker = "[green]●[/]" if p["active"] else "[dim]○[/]"
+            key_status = "[green]🔑[/]" if p["has_key"] else "[dim]🔒[/]"
+            model_count = f"[dim]({len(p['models'])} models)[/]" if p["models"] else ""
+            console.print(f"    {marker} [bold]{p['name']}[/] {key_status} {model_count}")
+            console.print(f"      [dim]{p['url']}[/]")
+        console.print(f"\n  [dim]Usage:[/]")
+        console.print(f"    [dim]/provider <name>              — switch to provider[/]")
+        console.print(f"    [dim]/provider <name> key <key>    — set API key[/]")
+        console.print(f"    [dim]/provider add <name> <url>    — add custom provider[/]")
+        console.print()
+        return
+
+    parts = args.split()
+
+
+    if parts[0] == "add" and len(parts) >= 3:
+        name = parts[1]
+        url = parts[2]
+        key = parts[3] if len(parts) > 3 else ""
+        result = providers.add(name, url, key)
+        console.print(f"  [green]{result}[/]")
+        return
+
+
+    if len(parts) >= 3 and parts[1] == "key":
+        name = parts[0]
+        key = parts[2]
+        result = providers.set_key(name, key)
+        console.print(f"  [green]{result}[/]")
+        return
+
+
+    name = parts[0]
+    result = providers.switch(name)
+    if result.startswith("✓"):
+        console.print(f"  [green]{result}[/]")
+
+        models = providers.fetch_models(name)
+        if models:
+            console.print(f"  [dim]Models: {', '.join(models[:8])}{'...' if len(models) > 8 else ''}[/]")
+    else:
+        console.print(f"  [red]{result}[/]")
+
+
+def show_logs(args: str):
+    """Show recent logs. Usage: /logs [errors] [N]"""
+    parts = args.split()
+    log_file = "errors.log" if "errors" in parts else "castor.log"
+    n = 20
+    for p in parts:
+        if p.isdigit():
+            n = int(p)
+
+    log_path = config.LOGS_DIR / log_file
+    if not log_path.exists():
+        console.print("  [dim]No logs yet.[/]")
+        return
+
+    lines = log_path.read_text().splitlines()
+    tail = lines[-n:]
+    console.print(f"  [bold]📋 {log_file}[/] [dim](last {len(tail)} lines)[/]\n")
+    for line in tail:
+        if "| ERROR" in line or "| WARNING" in line:
+            console.print(f"  [red]{line}[/]")
+        elif "| EVENT" in line:
+            console.print(f"  [cyan]{line}[/]")
+        else:
+            console.print(f"  [dim]{line}[/]")
+    console.print()
+
+
+def search_memory():
+    query = console.input("[cyan]  search query >[/] ").strip()
+    if not query:
+        return
+    import memory as mem
+    results = mem.search(query, limit=5)
+    if not results:
+        console.print("  [dim]No memories found.[/]")
+        return
+    for r in results:
+        score_color = "green" if r["score"] > 0.7 else "yellow" if r["score"] > 0.5 else "dim"
+        console.print(
+            f"  [{score_color}]●[/] [{score_color}]{r['score']}[/] "
+            f"[bold]{r['tag']}[/] → {r['text']}"
+        )
+
+
+_cron_results: list[tuple] = []
+
+def _on_cron_complete(name, task, result):
+    _cron_results.append((name, task, result))
+
+    print(f"\n\n  ⏰ Cron '{name}': {task[:60]}")
+    print(f"  {result[:200]}\n")
+    sys.stdout.flush()
+
+_CITY_TZ = {
+    "moscow": 3, "london": 0, "berlin": 1, "paris": 1,
+    "new york": -5, "los angeles": -8, "chicago": -6,
+    "tokyo": 9, "sydney": 11, "dubai": 4, "mumbai": 5,
+    "beijing": 8, "singapore": 8, "istanbul": 3,
+    "buenos aires": -3, "são paulo": -3, "sao paulo": -3,
+    "mexico city": -6, "bogota": -5, "lima": -5,
+    "bangkok": 7, "seoul": 9, "jakarta": 7,
+    "cairo": 2, "nairobi": 3, "lagos": 1,
+    "amsterdam": 1, "madrid": 1, "rome": 1,
+    "warsaw": 1, "kyiv": 2, "tbilisi": 4,
+}
+
+
+def _first_run_setup():
+    """Interactive setup on first launch — city, name, language, soul."""
+    console.print("\n  [bold yellow]⚡ Welcome to castor! Let's set up.[/]\n")
+
+
+    try:
+        import time as _time
+        offset = -(_time.timezone // 3600) if _time.daylight == 0 else -(_time.altzone // 3600)
+        config.TZ_OFFSET = offset
+        db.kv_set("timezone", str(offset))
+        tz_name = _time.tzname[0]
+        db.kv_set("timezone_name", tz_name)
+        console.print(f"  [green]✓[/] Timezone: UTC{'+' if offset >= 0 else ''}{offset} ({tz_name})")
+    except Exception:
+        config.TZ_OFFSET = 0
+
+
+    console.print("\n  [yellow]👤 What should I call you?[/] [dim](default: User)[/]")
+    user_name = input("  Your name: ").strip()
+    db.kv_set("user_name", user_name or "User")
+
+
+    console.print("\n  [yellow]🤖 What should your agent be called?[/] [dim](default: Agent)[/]")
+    name = input("  Name: ").strip()
+    if name:
+        db.kv_set("soul:name", name)
+
+
+    console.print("\n  [yellow]🗣 What language should it speak?[/] [dim](default: English)[/]")
+    lang = input("  Language: ").strip()
+    if lang:
+        db.kv_set("soul:language", lang)
+
+
+    console.print("\n  [yellow]✨ Quick personality setup (0-10, Enter to skip):[/]")
+    quick_traits = [
+        ("humor", "Humor", "serious ↔ funny"),
+        ("honesty", "Honesty", "diplomatic ↔ brutally direct"),
+        ("brevity", "Brevity", "verbose ↔ concise"),
+        ("formality", "Formality", "casual ↔ formal"),
+        ("creativity", "Creativity", "practical ↔ unconventional"),
+    ]
+    for key, label, desc in quick_traits:
+        try:
+            val = input(f"  {label} ({desc}): ").strip()
+            if val and val.isdigit():
+                v = max(0, min(10, int(val)))
+                db.kv_set(f"soul:{key}", str(v))
+        except EOFError:
+            break
+
+    db.kv_set("setup_complete", "1")
+    console.print("\n  [green]✓ Setup complete! Use /soul to tweak later.[/]\n")
+
+
+def _telemetry_first_run_prompt() -> None:
+    """Ask the user yes/no on first run only.
+
+    Stamps `telemetry_consent_version` regardless of answer, so the
+    prompt fires exactly once per install (unless the project bumps
+    the policy version). If the user is in a non-interactive context
+    (no TTY, e.g. systemd / CI), default to opt_out so we never enable
+    telemetry without explicit consent.
+    """
+    import telemetry
+    if telemetry.consent_decision_made():
+        return
+    # Non-interactive guard — silently decline, never auto-enable
+    if not sys.stdin.isatty():
+        telemetry.opt_out()
+        return
+
+    endpoint = config.get("telemetry_endpoint") or "(none)"
+    console.print()
+    console.print("  [bold]🔍 Enable anonymous metrics for the configured collector?[/]")
+    console.print("     [dim]No destination is bundled. Off by default.[/]")
+    console.print("     [dim]No chat content / no soul / no PII. Full policy:[/]")
+    console.print("     [dim]https://github.com/joker2still/castor/blob/main/docs/PRIVACY.md[/]")
+    console.print(f"     [dim]Sends to: {endpoint}[/]")
+    try:
+        ans = input("     Enable? [y/N]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        ans = ""
+    if ans in ("y", "yes"):
+        telemetry.opt_in()
+        console.print("     [green]✓ telemetry enabled — thank you[/]")
+    else:
+        telemetry.opt_out()
+        console.print("     [dim]✓ telemetry stays off[/]")
+    console.print()
+
+
+def _emit_cli_session_start() -> None:
+    """Build and emit the session_start telemetry event for CLI boot.
+
+    No-op unless telemetry is enabled (default OFF). All values are bucketed
+    / enum-bounded — never the URL, model id, or any PII. See docs/PRIVACY.md.
+    """
+    import telemetry
+    if not telemetry.enabled():
+        return
+    try:
+        import telegram_bot as _tg
+        has_telegram = bool(_tg.is_enabled() and _tg.get_token())
+    except Exception:
+        has_telegram = False
+    try:
+        has_camera = int(config.get("camera_index")) >= 0
+    except Exception:
+        has_camera = False
+    try:
+        import stt as _stt
+        has_voice = bool(config.get("tts_enabled")) or bool(_stt.is_available())
+    except Exception:
+        has_voice = False
+    try:
+        scheduled_jobs_count = len(scheduler.list_tasks())
+    except Exception:
+        scheduled_jobs_count = 0
+    try:
+        active_skills_count = len(skills.get_active())
+    except Exception:
+        active_skills_count = 0
+    try:
+        import rag as _rag
+        indexed_sources_count = int(_rag.get_status().get("files", 0))
+    except Exception:
+        try:
+            row = db.fetchone(
+                "SELECT COUNT(*) FROM kv WHERE key LIKE 'rag:mtime:%'"
+            )
+            indexed_sources_count = int(row[0]) if row else 0
+        except Exception:
+            indexed_sources_count = 0
+    try:
+        import mcp_client as _mcp
+        has_mcp = bool(_mcp.list_servers())
+    except Exception:
+        has_mcp = False
+    provider_kind = telemetry.provider_kind_from_name(providers.get_active_name())
+    telemetry.track_event("session_start", {
+        "castor_version": str(config.VERSION),
+        "python_version": telemetry.python_version(),
+        "os": telemetry.os_kind(),
+        "provider_kind": provider_kind,
+        "model_size_bucket": telemetry.bucket_model_size(None),
+        "has_web_ui": False,
+        "has_telegram": has_telegram,
+        "has_voice": has_voice,
+        "has_camera": has_camera,
+        "has_scheduler": True,
+        "has_mcp": has_mcp,
+        "active_skills_count": int(active_skills_count),
+        "scheduled_jobs_count": int(scheduled_jobs_count),
+        "indexed_sources_count": int(indexed_sources_count),
+    })
+
+
+def main():
+
+    try:
+        db.check_and_restore()
+    except Exception as e:
+        _log.warning(f"db integrity check startup: {e}")
+
+    if not db.kv_get("setup_complete"):
+        _first_run_setup()
+    else:
+
+        tz_val = db.kv_get("timezone")
+        if tz_val is not None:
+            config.TZ_OFFSET = int(tz_val)
+
+
+    scheduler.on_complete(_on_cron_complete)
+    scheduler.start()
+    console.print(f"  [dim]⏰ Scheduler running (UTC{config.TZ_OFFSET:+d})[/]")
+
+    try:
+        db.start_backup_scheduler()
+    except Exception as e:
+        _log.warning(f"db backup scheduler startup: {e}")
+
+    show_banner()
+    _log.info("session started | model=%s | user=%s", config.LLM_MODEL, db.kv_get("user_name") or "User")
+
+
+    try:
+        _telemetry_first_run_prompt()
+    except Exception as e:
+        _log.debug("telemetry prompt failed (non-fatal): %s", e)
+
+
+    try:
+        _emit_cli_session_start()
+    except Exception as e:
+        _log.warning("telemetry session_start failed: %s", e)
+
+    while True:
+        try:
+
+            _check_background_tasks()
+            while _cron_results:
+                name, task, result = _cron_results.pop(0)
+                console.print(f"\n  [bold]⏰ Cron '{name}':[/] {task[:60]}")
+                console.print(f"  [dim]{result[:200]}[/]\n")
+
+            console.print(f"  [dim]{_status_line()}[/]")
+            console.print("  [dim]" + "─" * (console.width - 4) + "[/]")
+            user_input = input("  ⚡ > ").strip()
+        except (EOFError, KeyboardInterrupt):
+            _log.info("session ended (user exit)")
+            console.print("\n  [dim]👋[/]")
+            break
+
+        if not user_input:
+            continue
+        if user_input == "/quit":
+            console.print("  [dim]👋[/]")
+            break
+        if user_input == "/help" or user_input == "/?":
+            show_help()
+            continue
+        if user_input == "/clear":
+            db.clear_history()
+            console.print("  [yellow]✓ History cleared.[/]")
+            continue
+        if user_input == "/stats":
+            show_stats()
+            continue
+        if user_input == "/doctor":
+            doctor()
+            continue
+        if user_input == "/mcp" or user_input.startswith("/mcp "):
+            handle_mcp(user_input[4:].strip())
+            continue
+        if user_input == "/synthesis":
+            handle_synthesis()
+            continue
+        if user_input == "/entities":
+            show_entities()
+            continue
+        if user_input == "/wiki" or user_input.startswith("/wiki "):
+            handle_wiki(user_input[5:].strip())
+            continue
+        if user_input == "/files":
+            show_indexed_files()
+            continue
+        if user_input == "/file" or user_input.startswith("/file "):
+            handle_file_upload(user_input[5:].strip())
+            continue
+        if user_input.startswith("/soul"):
+            handle_soul_command(user_input[5:].strip())
+            continue
+        if user_input.startswith("/skills"):
+            handle_skills_command(user_input[7:].strip())
+            continue
+        if user_input == "/preset" or user_input.startswith("/preset "):
+            handle_preset_command(user_input[7:].strip())
+            continue
+        if user_input == "/tasks":
+            show_tasks()
+            continue
+        if user_input.startswith("/cron"):
+            handle_cron(user_input[5:].strip())
+            continue
+        if user_input == "/memory":
+            search_memory()
+            continue
+        if user_input.startswith("/logs"):
+            show_logs(user_input[5:].strip())
+            continue
+        if user_input.startswith("/thread"):
+            handle_thread(user_input[7:].strip())
+            continue
+        if user_input.startswith("/model"):
+            handle_model(user_input[6:].strip())
+            continue
+        if user_input.startswith("/telegram"):
+            handle_telegram(user_input[9:].strip())
+            continue
+        if user_input.startswith("/provider"):
+            handle_provider(user_input[9:].strip())
+            continue
+        if user_input == "/thinking":
+            current = db.kv_get("thinking_enabled") == "true"
+            new_val = not current
+            db.kv_set("thinking_enabled", str(new_val).lower())
+            console.print(f"  [yellow]💭 thinking: {'ON' if new_val else 'OFF'}[/]")
+            continue
+        if user_input.startswith("/"):
+            console.print(f"  [dim]Unknown command: {user_input.split()[0]}[/]")
+            continue
+
+
+        _cli_content_buf = ""
+        _cli_content_lock = threading.Lock()
+        _cli_live_ref = [None]
+
+        def _on_content_token(text: str):
+            nonlocal _cli_content_buf
+            with _cli_content_lock:
+                _cli_content_buf += text
+                buf_snapshot = _cli_content_buf
+            live = _cli_live_ref[0]
+            if live:
+                try:
+                    live.update(Markdown(buf_snapshot))
+                except Exception:
+                    pass
+
+        _cli_tool_log: list[str] = []
+
+        def _on_tool_call(name: str, args_preview: str, result_preview: str = ""):
+
+            short_args = args_preview[:60] + "..." if len(args_preview) > 60 else args_preview
+            _cli_tool_log.append(f"  [cyan]🔧 {name}[/][dim]({short_args})[/]")
+
+        agent._content_callback = _on_content_token
+        agent._tool_call_callback = _on_tool_call
+
+        try:
+            console.print()
+            console.print("  🦆 ", end="")
+            with Live(Markdown("▍"), console=console, refresh_per_second=8, vertical_overflow="visible") as live:
+                _cli_live_ref[0] = live
+                result = agent.run(user_input)
+                _cli_live_ref[0] = None
+
+                live.update(Markdown(result.reply))
+        except Exception as e:
+            _cli_live_ref[0] = None
+            _log.error(f"agent.run crashed: {e}", exc_info=True)
+            console.print(f"  [red]✗ {str(e).replace('[', '(').replace(']', ')')}[/]")
+            continue
+        finally:
+            agent._content_callback = None
+            agent._tool_call_callback = None
+
+
+        if _cli_tool_log:
+            for line in _cli_tool_log:
+                console.print(line)
+
+
+        tok_s = getattr(result, "tok_per_sec", 0)
+        tokens = getattr(result, "completion_tokens", 0)
+        tools = len(getattr(result, "tool_calls_made", []))
+        stats_parts = []
+        if tokens:
+            stats_parts.append(f"{tokens} tok")
+        if tok_s:
+            stats_parts.append(f"{tok_s} tok/s")
+        if tools:
+            stats_parts.append(f"{tools} tools")
+        if stats_parts:
+            console.print(f"  [dim]· {' · '.join(stats_parts)}[/]")
+        console.print()
+
+
+    try:
+        db.graceful_shutdown()
+    except Exception:
+        pass
+
+
+def show_help():
+    """Show all available slash commands."""
+    console.print("\n  [bold yellow]castor commands[/]\n")
+    cmds = [
+        ("/help", "show this help"),
+        ("/clear", "clear history"),
+        ("/stats", "session stats"),
+        ("/doctor", "run full diagnostics"),
+        ("/quit /exit", "exit"),
+        ("", ""),
+        ("[bold]Agent[/]", ""),
+        ("/soul", "edit personality traits"),
+        ("/skills", "toggle skill plugins"),
+        ("/preset", "business preset: list/install/activate/rm"),
+        ("/model [name]", "switch model"),
+        ("/provider [name]", "switch provider"),
+        ("/thinking", "toggle thinking mode"),
+        ("", ""),
+        ("[bold]Memory[/]", ""),
+        ("/memory", "search memory interactively"),
+        ("/entities", "show knowledge graph entities"),
+        ("/wiki [name]", "list or read wiki pages"),
+        ("/synthesis", "run night synthesis manually"),
+        ("", ""),
+        ("[bold]Files[/]", ""),
+        ("/files", "list indexed files"),
+        ("/file <path>", "upload and index a file"),
+        ("", ""),
+        ("[bold]Threads[/]", ""),
+        ("/thread", "manage threads"),
+        ("", ""),
+        ("[bold]Tasks & MCP[/]", ""),
+        ("/cron", "scheduled tasks"),
+        ("/tasks", "background tasks"),
+        ("/mcp", "manage MCP servers"),
+        ("", ""),
+        ("[bold]Integrations[/]", ""),
+        ("/telegram", "telegram bot config"),
+        ("/logs [level]", "view logs"),
+    ]
+    for cmd, desc in cmds:
+        if not cmd and not desc:
+            console.print()
+        elif not desc:
+            console.print(f"  {cmd}")
+        else:
+            console.print(f"  [cyan]{cmd:<18}[/] {desc}")
+    console.print()
+
+
+def handle_mcp(args: str):
+    """Handle /mcp commands: list, add, remove, restart, toggle."""
+    import mcp_client
+    parts = args.split(maxsplit=1)
+    cmd = parts[0] if parts else "list"
+
+    if cmd in ("", "list"):
+        servers = mcp_client.list_servers()
+        if not servers:
+            console.print("  [dim]No MCP servers configured.[/]")
+            console.print("  Add one: [cyan]/mcp add <name> <command>[/]")
+            return
+        console.print("\n  [bold yellow]MCP Servers[/]\n")
+        for s in servers:
+            status = "[green]✓ running[/]" if s.get("running") else "[dim]○ stopped[/]"
+            tools = f"{s.get('tool_count', 0)} tools" if s.get("running") else ""
+            console.print(f"  {status} [cyan]{s['name']}[/] — {s.get('transport', '?')} {tools}")
+        console.print()
+    elif cmd == "restart":
+        name = parts[1] if len(parts) > 1 else None
+        if not name:
+            console.print("  Usage: [cyan]/mcp restart <name>[/]")
+            return
+        try:
+            mcp_client.restart_server(name)
+            console.print(f"  [green]✓ Restarted {name}[/]")
+        except Exception as e:
+            console.print(f"  [red]✗ {e}[/]")
+    elif cmd == "remove":
+        name = parts[1] if len(parts) > 1 else None
+        if not name:
+            console.print("  Usage: [cyan]/mcp remove <name>[/]")
+            return
+        try:
+            mcp_client.remove_server(name)
+            console.print(f"  [green]✓ Removed {name}[/]")
+        except Exception as e:
+            console.print(f"  [red]✗ {e}[/]")
+    else:
+        console.print(f"  Unknown subcommand: {cmd}")
+        console.print("  Available: list, restart, remove")
+
+
+def handle_synthesis():
+    """Run knowledge graph synthesis manually."""
+    import synthesis
+    import memory
+    pending = memory.get_pending_synthesis(limit=100)
+    pending_count = sum(len(v) for v in pending.values())
+    if pending_count == 0:
+        console.print("  [dim]No pending items for synthesis.[/]")
+        return
+    console.print(f"\n  [yellow]Running synthesis on {pending_count} chunks in {len(pending)} groups...[/]")
+    try:
+        result = synthesis.run_synthesis()
+        console.print(f"  [green]✓ {result}[/]\n")
+    except Exception as e:
+        console.print(f"  [red]✗ {e}[/]")
+
+
+def show_entities():
+    """Show knowledge graph entities."""
+    import memory
+    try:
+        entities = memory.get_all_entities(limit=100)
+    except Exception as e:
+        console.print(f"  [red]✗ Failed to load entities: {e}[/]")
+        return
+    if not entities:
+        console.print("  [dim]No entities yet. Save knowledge and run /synthesis.[/]")
+        return
+    console.print(f"\n  [bold yellow]Knowledge Graph — {len(entities)} entities[/]\n")
+    type_colors = {
+        "technology": "yellow", "person": "blue", "project": "green",
+        "concept": "magenta", "place": "red", "event": "cyan",
+    }
+    for e in sorted(entities, key=lambda x: -x.get("observation_count", 0))[:30]:
+        name = e.get("name", "?")
+        color = type_colors.get(e.get("type", "concept"), "white")
+        rels = e.get("relations", [])
+        rel_str = ", ".join(f"{r.get('rel','?')}→{r.get('to','?')}" for r in rels[:3])
+        if len(rels) > 3:
+            rel_str += f" (+{len(rels)-3})"
+        console.print(f"  [{color}]●[/] [bold]{name}[/] "
+                     f"[dim]({e.get('type', '?')}, obs:{e.get('observation_count', 1)})[/]")
+        if e.get("description"):
+            console.print(f"      [dim]{e['description'][:80]}[/]")
+        if rel_str:
+            console.print(f"      [dim]→ {rel_str}[/]")
+    console.print()
+
+
+def handle_wiki(args: str):
+    """List or read wiki pages."""
+    wiki_dir = config.DATA_DIR / "wiki"
+    if not wiki_dir.exists():
+        console.print("  [dim]No wiki yet. Run /synthesis after saving some knowledge.[/]")
+        return
+
+    if not args:
+
+        pages = sorted(wiki_dir.glob("*.md"))
+        if not pages:
+            console.print("  [dim]No wiki pages yet.[/]")
+            return
+        console.print(f"\n  [bold yellow]Wiki pages ({len(pages)})[/]\n")
+        for p in pages:
+            if p.name in ("index.md", "log.md"):
+                continue
+            size = p.stat().st_size
+            console.print(f"  [cyan]{p.stem}[/] [dim]({size} bytes)[/]")
+        console.print(f"\n  Read: [cyan]/wiki <name>[/]\n")
+    else:
+
+        name = args.lower().replace(" ", "_")
+        if ".." in name or "/" in name or "\\" in name:
+            console.print("  [red]Invalid page name[/]")
+            return
+        page = wiki_dir / f"{name}.md"
+        if not page.exists():
+            console.print(f"  [red]Page '{args}' not found[/]")
+            return
+        try:
+            content = page.read_text(encoding="utf-8")
+        except Exception as e:
+            console.print(f"  [red]Cannot read page: {e}[/]")
+            return
+        console.print()
+        console.print(Markdown(content))
+        console.print()
+
+
+def show_indexed_files():
+    """List all indexed files."""
+    import rag
+    files = rag.list_indexed_files()
+    if not files:
+        console.print("  [dim]No indexed files. Upload via Web UI or use /file <path>.[/]")
+        return
+    console.print(f"\n  [bold yellow]Indexed files ({len(files)})[/]\n")
+    for f in files:
+        tags = f.get("tags", [])
+        tag_str = f" [dim]#{', '.join(tags)}[/]" if tags else ""
+        console.print(f"  [cyan]{f.get('filename', '?')}[/]{tag_str}")
+        console.print(f"    [dim]{f.get('path', '')}[/]")
+    console.print()
+
+
+def handle_file_upload(path: str):
+    """Index a file into knowledge base via /file <path>."""
+    import rag
+    from pathlib import Path
+    if not path:
+        console.print("  Usage: [cyan]/file <path>[/]")
+        return
+    fpath = Path(path).expanduser().resolve()
+    if not fpath.exists():
+        console.print(f"  [red]File not found: {fpath}[/]")
+        return
+    console.print(f"\n  [yellow]Indexing {fpath.name}...[/]")
+    try:
+        result = rag.index_file(str(fpath))
+        status = result.get("status", "?")
+        chunks = result.get("chunks", 0)
+        color = "green" if status == "indexed" else "yellow"
+        console.print(f"  [{color}]✓ {status}: {chunks} chunks[/]\n")
+    except Exception as e:
+        console.print(f"  [red]✗ {e}[/]")
+
+
+def handle_telegram(args: str):
+    """Handle /telegram commands."""
+    import telegram_bot
+
+    parts = args.split(maxsplit=1)
+    cmd = parts[0] if parts else ""
+    val = parts[1] if len(parts) > 1 else ""
+
+    if not cmd or cmd == "status":
+        s = telegram_bot.status()
+        console.print(f"\n  [bold yellow]Telegram Bot[/]")
+        console.print(f"  Token:    {'✓ set' if s['has_token'] else '✗ not set'}")
+        console.print(f"  Enabled:  {'✓' if s['enabled'] else '✗'}")
+        console.print(f"  Running:  {'✓' if s['running'] else '✗'}")
+        console.print(f"  Bot:      @{s['username'] or '—'}")
+        console.print(f"  Owner:    {'@' + s['owner_username'] if s['verified'] else 'not verified'}")
+        console.print(f"  Groups:   {s['allowed_groups'] or 'any'}")
+        console.print(f"  Mode:     {s['group_mode']}")
+        console.print(f"  Topics:   {'on' if s['topics_enabled'] else 'off'}")
+        if s.get('has_pending_code'):
+            console.print(f"\n  [yellow]⏳ Activation code pending — send it to the bot in Telegram[/]")
+        console.print(f"\n  [dim]Commands: /telegram token <TOKEN> | activate | start | stop | reset[/]\n")
+        return
+
+    if cmd == "token":
+        if not val:
+            console.print("  [red]Usage: /telegram token <BOT_TOKEN>[/]")
+            return
+        telegram_bot.set_token(val)
+        me = telegram_bot.get_me(val)
+        if me:
+            console.print(f"  [green]✓ Token saved — @{me.get('username')}[/]")
+            console.print(f"  [dim]Next: /telegram start → /telegram activate[/]")
+        else:
+            console.print(f"  [red]✗ Invalid token[/]")
+        return
+
+    if cmd == "activate":
+        if telegram_bot.is_verified():
+            console.print(f"  [yellow]Already verified as @{telegram_bot.get_owner_username()}[/]")
+            console.print(f"  [dim]Run /telegram reset first to re-verify[/]")
+            return
+        if not telegram_bot.get_token():
+            console.print(f"  [red]Set bot token first: /telegram token <TOKEN>[/]")
+            return
+        code = telegram_bot.generate_activation_code()
+        console.print(f"\n  [bold green]🔑 Activation code: {code}[/]")
+        console.print(f"  [dim]Send this code to your bot in Telegram within 10 minutes.[/]")
+        console.print(f"  [dim]⚠️  3 wrong attempts = permanent ban for that Telegram user.[/]\n")
+        return
+
+    if cmd == "start":
+        telegram_bot.set_enabled(True)
+        from server import _telegram_handler
+        telegram_bot.start(on_message=_telegram_handler)
+        console.print(f"  [green]✓ Bot started[/]")
+        if not telegram_bot.is_verified():
+            console.print(f"  [yellow]Run /telegram activate to generate an activation code[/]")
+        return
+
+    if cmd == "stop":
+        telegram_bot.stop()
+        telegram_bot.set_enabled(False)
+        console.print(f"  [yellow]✓ Bot stopped[/]")
+        return
+
+    if cmd == "reset":
+        db.kv_set("telegram:owner_id", "")
+        db.kv_set("telegram:owner_username", "")
+        telegram_bot.clear_verification()
+        console.print(f"  [yellow]✓ Owner reset. Re-verify needed.[/]")
+        return
+
+    console.print(f"  [dim]Unknown: /telegram {cmd}[/]")
+
+
+def doctor():
+    """Run diagnostics on all castor components."""
+    import time as _time
+
+
+    from rich.console import Console as _C
+    console = _C(highlight=False)
+    _orig_print = console.print
+    def _safe_print(*a, **kw):
+        try:
+            _orig_print(*a, **kw)
+        except UnicodeEncodeError:
+            text = " ".join(str(x) for x in a)
+            print(text.encode("ascii", "replace").decode("ascii"))
+    console.print = _safe_print
+
+    console.print("\n  [bold yellow]castor doctor[/]\n")
+    passed = 0
+    failed = 0
+    warnings = 0
+
+    def check(name, fn):
+        nonlocal passed, failed, warnings
+        try:
+            result = fn()
+            if result is True or (isinstance(result, str) and result.startswith("✓")):
+                msg = result if isinstance(result, str) else "✓"
+                console.print(f"  [green]✓[/] {name}: {msg}")
+                passed += 1
+            elif isinstance(result, str) and result.startswith("⚠"):
+                console.print(f"  [yellow]⚠[/] {name}: {result}")
+                warnings += 1
+            else:
+                console.print(f"  [red]✗[/] {name}: {result}")
+                failed += 1
+        except Exception as e:
+            console.print(f"  [red]✗[/] {name}: {str(e)[:100]}")
+            failed += 1
+
+
+    console.print("  [dim]── Core ──[/]")
+    import sys
+    check("Python", lambda: f"✓ {sys.version.split()[0]}")
+
+    def _check_deps():
+        missing = []
+        for mod in ["openai", "qdrant_client", "fastapi", "uvicorn", "rich", "requests"]:
+            try:
+                __import__(mod)
+            except ImportError:
+                missing.append(mod)
+        if missing:
+            return f"missing: {', '.join(missing)}"
+        return True
+    check("Dependencies", _check_deps)
+
+
+    console.print("  [dim]── Storage ──[/]")
+    def _check_db():
+        tables = [r[0] for r in db.fetchall("SELECT name FROM sqlite_master WHERE type='table'")]
+        msg_count = db.fetchone("SELECT COUNT(*) FROM messages")[0]
+        kv_count = db.fetchone("SELECT COUNT(*) FROM kv")[0]
+        return f"✓ {len(tables)} tables, {msg_count} messages, {kv_count} settings"
+    check("SQLite", _check_db)
+
+
+    def _check_qdrant():
+        import memory as mem
+        count = mem.count()
+        return f"✓ {count} memories ({config.QDRANT_MODE} mode)"
+    check("Qdrant", _check_qdrant)
+
+
+    console.print("  [dim]── LLM ──[/]")
+    def _check_provider():
+        p = providers.get_active_name()
+        model = providers.get_model()
+        url = providers.get_url()
+        return f"✓ {model} @ {p} ({url})"
+    check("Provider", _check_provider)
+
+    def _check_llm_connection():
+        import requests as _req
+        url = providers.get_url().rstrip("/")
+        try:
+            r = _req.get(f"{url}/models", timeout=5)
+            if r.ok:
+                models = r.json().get("data", [])
+                return f"✓ {len(models)} models available"
+            return f"HTTP {r.status_code}"
+        except _req.ConnectionError:
+            return "connection refused — is LM Studio running?"
+        except Exception as e:
+            return str(e)[:80]
+    check("LLM API", _check_llm_connection)
+
+    def _check_model_loaded():
+        active = providers.get_active_name()
+        if active not in ("lmstudio", "ollama"):
+            return "✓ cloud provider (always available)"
+        import requests as _req
+        url = providers.get_url().rstrip("/").replace("/v1", "")
+        model = providers.get_model()
+        try:
+            r = _req.get(f"{url}/api/v1/models", timeout=5)
+            if r.ok:
+                for m in r.json().get("models", []):
+                    if m.get("key") == model and m.get("loaded_instances"):
+                        return f"✓ {model} loaded in memory"
+                return f"⚠ {model} downloaded but NOT loaded (will auto-load on first request)"
+        except Exception:
+            pass
+        return f"⚠ could not check model status"
+    check("Model loaded", _check_model_loaded)
+
+
+    def _check_embeddings():
+        try:
+            import memory
+            vec = memory.embed("test")
+
+
+            provider_hint = ""
+            try:
+                model = memory._get_dense_model()
+                sess = getattr(model, "model", None) or getattr(model, "_model", None)
+                providers = None
+                if sess and hasattr(sess, "model"):
+                    inner = getattr(sess, "model", None)
+                    if inner and hasattr(inner, "get_providers"):
+                        providers = inner.get_providers()
+                if providers:
+                    active = providers[0].replace("ExecutionProvider", "")
+                    provider_hint = f" via {active}"
+            except Exception:
+                pass
+            return f"✓ FastEmbed ({memory.DENSE_MODEL_NAME}, {len(vec)}d){provider_hint}"
+        except Exception as e:
+            msg = str(e).lower()
+            hint = ""
+            if "cuda" in msg or "loadlibrary" in msg or "onnxruntime_providers_cuda" in msg:
+                hint = " — set CASTOR_EMBED_DEVICE=cpu or run: pip uninstall onnxruntime-gpu"
+            return (str(e)[:100] + hint) if hint else str(e)[:120]
+    check("Embeddings", _check_embeddings)
+
+
+    def _check_onnxruntime_variant():
+        try:
+            import importlib.metadata as _md
+
+
+            try:
+                if config.get("embed_device") == "cuda":
+                    return "✓ onnxruntime-gpu — user-configured (embed_device=cuda)"
+            except Exception:
+                pass
+
+            def _pkg_disk_size(pkg_name):
+                """Estimate installed package size in bytes."""
+                try:
+                    files = _md.files(pkg_name)
+                    if not files:
+                        return 0
+                    import pathlib as _pl
+                    total = 0
+                    dist_loc = None
+                    for f in files:
+                        p = _pl.Path(f.locate())
+                        if dist_loc is None:
+                            dist_loc = p.parent
+                        if p.is_file():
+                            total += p.stat().st_size
+
+                    if total < 1_000_000 and dist_loc and dist_loc.is_dir():
+                        total = sum(p.stat().st_size for p in dist_loc.rglob("*") if p.is_file())
+                    return total
+                except Exception:
+                    return 0
+
+            def _fmt_size(nbytes):
+                if nbytes >= 1_073_741_824:
+                    return f"~{nbytes / 1_073_741_824:.1f} GB"
+                if nbytes >= 1_048_576:
+                    return f"~{nbytes / 1_048_576:.0f} MB"
+                return f"~{nbytes / 1024:.0f} KB"
+
+            try:
+                _md.version("onnxruntime-gpu")
+                size_hint = ""
+                sz = _pkg_disk_size("onnxruntime-gpu")
+                if sz:
+                    size_hint = f" ({_fmt_size(sz)} disk)"
+
+                if os.environ.get("CUDA_PATH") or os.environ.get("CUDA_HOME"):
+                    return ("⚠ onnxruntime-gpu detected alongside CUDA toolkit"
+                            f"{size_hint}. Castor uses CPU embeddings by default; "
+                            "the GPU package is unused unless embed_device=cuda is set.")
+                return ("⚠ onnxruntime-gpu detected — castor is CPU-only by design."
+                        f"{size_hint} "
+                        "Run: pip uninstall onnxruntime-gpu && pip install onnxruntime")
+            except _md.PackageNotFoundError:
+                pass
+            try:
+                _md.version("onnxruntime")
+                return "✓ onnxruntime (CPU) — correct for castor"
+            except _md.PackageNotFoundError:
+                return "⚠ neither onnxruntime nor onnxruntime-gpu found (fastembed may not work)"
+        except Exception as e:
+            return f"? onnxruntime check skipped: {e}"
+    check("ONNX Runtime", _check_onnxruntime_variant)
+
+
+    def _check_inference():
+        t0 = _time.time()
+        try:
+            client = providers.get_client()
+            providers.ensure_model_loaded()
+            resp = client.chat.completions.create(
+                model=providers.get_model(),
+                messages=[{"role": "user", "content": "Say 'ok' and nothing else."}],
+                max_tokens=10,
+                temperature=0,
+            )
+            elapsed = _time.time() - t0
+            reply = (resp.choices[0].message.content or "").strip()
+            tokens = resp.usage.completion_tokens if resp.usage else "?"
+            return f"✓ replied '{reply[:20]}' in {elapsed:.1f}s ({tokens} tokens)"
+        except Exception as e:
+            return str(e)[:100]
+    check("Inference", _check_inference)
+
+
+    console.print("  [dim]── Integrations ──[/]")
+    def _check_telegram():
+        import telegram_bot as tb
+        s = tb.status()
+        if not s["has_token"]:
+            return "⚠ no token configured"
+        if not s["running"]:
+            return "⚠ not running (enable in settings)"
+        if not s["verified"]:
+            return f"⚠ running as @{s['username']} but not verified"
+        return f"✓ @{s['username']} (owner: @{s['owner_username']})"
+    check("Telegram", _check_telegram)
+
+
+    def _check_threads():
+        all_t = threads.list_all()
+        active = threads.get_active_id()
+        return f"✓ {len(all_t)} threads, active: {active}"
+    check("Threads", _check_threads)
+
+
+    def _check_skills():
+        active = skills.get_active()
+        all_s = skills.list_all()
+        return f"✓ {len(active)}/{len(all_s)} active"
+    check("Skills", _check_skills)
+
+
+    def _check_tools():
+        import tools as t
+        all_tools = t.get_all_tools()
+        return f"✓ {len(all_tools)} tools registered"
+    check("Tools", _check_tools)
+
+
+    console.print("  [dim]── Scheduler ──[/]")
+    def _check_scheduler():
+        try:
+            import scheduler
+            tasks = scheduler.list_tasks()
+            return f"✓ {len(tasks)} scheduled tasks"
+        except Exception as e:
+            return f"⚠ {e}"
+    check("Cron", _check_scheduler)
+
+    def _check_heartbeat():
+        hb_enabled = db.kv_get("heartbeat:enabled") != "0"
+        raw = db.kv_get("heartbeat:items")
+        import json
+        items = json.loads(raw) if raw else []
+        status = "ON" if hb_enabled else "OFF"
+        return f"✓ {status}, {len(items)} items"
+    check("Heartbeat", _check_heartbeat)
+
+
+    console.print("  [dim]── Voice ──[/]")
+    def _check_stt():
+        try:
+            import stt
+            backend = config.get("stt_backend")
+            has_whisper = stt._check_faster_whisper()
+            has_decoder = stt._has_audio_decoder()
+            api_key = bool(config.get("stt_openai_key"))
+            parts = []
+            if has_whisper: parts.append(f"whisper ({config.get('stt_model')})")
+            if has_decoder:
+                import shutil
+                parts.append("ffmpeg" if shutil.which("ffmpeg") else "PyAV")
+            if api_key: parts.append("API")
+            if not parts:
+                return "⚠ no STT backend available"
+            return f"✓ {' + '.join(parts)} [backend={backend}]"
+        except Exception as e:
+            return f"⚠ {e}"
+    check("STT", _check_stt)
+
+    def _check_tts():
+        try:
+            if str(config.get("tts_enabled")) != "1":
+                return "⚠ disabled (set tts_enabled=1)"
+            url = config.get("tts_api_url") or ""
+            if not url:
+                return "⚠ no tts_api_url configured"
+            import requests as _req
+            try:
+                _req.get(url, timeout=3)
+                return f"✓ server reachable at {url}"
+            except _req.ConnectionError:
+                return f"⚠ server not reachable at {url}"
+        except Exception:
+            return "⚠ tts module not available"
+    check("TTS", _check_tts)
+
+
+    console.print("  [dim]── Agent Loop ──[/]")
+    def _check_loop_v2():
+        try:
+            from agent_loop import run_loop  # noqa: F401 — availability check
+            from agent_events import EventEmitter  # noqa: F401 — availability check
+            from agent_budget import BudgetLimits  # noqa: F401 — availability check
+            max_turns = config.get("max_tool_rounds")
+            return f"✓ loaded, max_turns={max_turns}"
+        except ImportError as e:
+            return f"⚠ loop modules missing: {e}"
+    check("Agent Loop", _check_loop_v2)
+
+
+    def _check_mcp():
+        try:
+            import mcp_client
+            servers = mcp_client.list_servers()
+            if not servers:
+                return "✓ no MCP servers configured"
+            running = sum(1 for s in servers if s.get("running"))
+            total_tools = sum(s.get("tool_count", 0) for s in servers if s.get("running"))
+            return f"✓ {running}/{len(servers)} running, {total_tools} tools"
+        except Exception as e:
+            return f"⚠ {e}"
+    check("MCP", _check_mcp)
+
+
+    def _check_browser():
+        try:
+            from playwright.sync_api import sync_playwright  # noqa: F401 — availability check
+            return "✓ playwright installed"
+        except ImportError:
+            return "⚠ playwright not installed (browser skill unavailable)"
+    check("Browser", _check_browser)
+
+    def _check_camera():
+        cam_idx = config.get("camera_index")
+        try:
+            import cv2
+            idx = cam_idx if cam_idx >= 0 else 0
+            cap = cv2.VideoCapture(idx)
+            if cap.isOpened():
+                ret, frame = cap.read()
+                cap.release()
+                if ret:
+                    h, w = frame.shape[:2]
+                    return f"✓ camera {cam_idx if cam_idx >= 0 else 'auto'}: {w}x{h}"
+                return "⚠ camera opened but read failed"
+            cap.release()
+            return "⚠ no camera available"
+        except ImportError:
+            return "⚠ opencv not installed (pip install opencv-python-headless)"
+    check("Camera", _check_camera)
+
+    def _check_serial():
+        """Hardware: enumerate serial / USB-COM ports + permission hints.
+        Reports plain count + flags Linux dialout group missing (the #1
+        gotcha for the serial_port skill on fresh installs)."""
+        try:
+            import serial.tools.list_ports as lp
+        except ImportError:
+            return "- pyserial not installed"
+        try:
+            ports = list(lp.comports())
+        except Exception as e:
+            return f"- enumeration failed: {e}"
+        suffix = ""
+        if sys.platform.startswith("linux"):
+            try:
+                import grp
+                import getpass
+                user = getpass.getuser()
+                groups = [g.gr_name for g in grp.getgrall() if user in g.gr_mem]
+                if "dialout" not in groups:
+                    suffix = (" [yellow](note: '" + user + "' not in 'dialout' "
+                              "group - serial reads may need: sudo usermod "
+                              "-aG dialout " + user + ")[/]")
+            except Exception:
+                pass
+        if not ports:
+            return f"- no devices plugged in" + suffix
+
+
+        names = [p.device for p in ports[:3]]
+        more = f" (+{len(ports) - 3} more)" if len(ports) > 3 else ""
+        return f"✓ {len(ports)} port(s): {', '.join(names)}{more}{suffix}"
+    check("Serial", _check_serial)
+
+
+    console.print("  [dim]── Knowledge ──[/]")
+    def _check_rag():
+        try:
+            import rag
+            stats = rag.stats()
+            return f"✓ {stats.get('total_chunks', 0)} chunks, {stats.get('total_files', 0)} files"
+        except Exception:
+            return "⚠ no indexed knowledge"
+    check("Files", _check_rag)
+
+    def _check_kg():
+        try:
+            import memory
+            entities = memory.get_all_entities(limit=500)
+            from qdrant_client.models import Filter, FieldCondition, MatchValue
+            qc = memory._get_qdrant()
+            wiki_count = qc.count(
+                config.QDRANT_COLLECTION,
+                count_filter=Filter(must=[FieldCondition(key="tag", match=MatchValue(value="wiki"))]),
+            ).count
+            pending = memory.get_pending_synthesis(limit=100)
+            pending_count = sum(len(v) for v in pending.values())
+            return f"✓ {len(entities)} entities, {wiki_count} wiki chunks, {pending_count} pending synthesis"
+        except Exception as e:
+            return f"⚠ {str(e)[:60]}"
+    check("Knowledge Graph", _check_kg)
+
+    def _check_synthesis_cron():
+        try:
+            import scheduler
+            enabled = config.get("synthesis_enabled")
+            if not enabled:
+                return "⚠ synthesis disabled"
+            sched_time = config.get("synthesis_time")
+
+            tasks = scheduler.list_tasks()
+            has_synth = any(t.get("name") == scheduler.SYNTHESIS_TASK_NAME for t in tasks)
+            return f"✓ registered for {sched_time} daily" if has_synth else "⚠ not registered in scheduler"
+        except Exception as e:
+            return f"⚠ {e}"
+    check("Synthesis", _check_synthesis_cron)
+
+    def _check_wiki_dir():
+        try:
+            wiki_dir = config.DATA_DIR / "wiki"
+            if not wiki_dir.exists():
+                return "⚠ wiki dir doesn't exist (no synthesis runs yet)"
+            md_files = list(wiki_dir.glob("*.md"))
+            return f"✓ {len(md_files)} wiki pages on disk"
+        except Exception as e:
+            return f"⚠ {e}"
+    check("Wiki", _check_wiki_dir)
+
+    def _check_fts():
+        try:
+            count = db.fetchone("SELECT COUNT(*) FROM fts_rag")[0]
+            mem_count = db.fetchone("SELECT COUNT(*) FROM fts_memory")[0]
+            return f"✓ BM25 index: {count} rag + {mem_count} memory entries"
+        except Exception:
+            return "⚠ FTS5 tables not found (BM25 not active)"
+    check("BM25", _check_fts)
+
+    def _check_ytdlp():
+        try:
+            import yt_dlp
+            return f"✓ yt-dlp {yt_dlp.version.__version__} (YouTube transcripts)"
+        except ImportError:
+            return "⚠ yt-dlp not installed — YouTube import will fall back to markitdown (often broken by bot-detection)"
+    check("yt-dlp", _check_ytdlp)
+
+
+    def _check_presets():
+        import presets
+        items = presets.list_installed()
+        active = presets.get_active()
+        count = len(items)
+        if count == 0:
+            return "✓ 0 installed"
+        if active:
+            return f"✓ {count} installed, active: {active}"
+        return f"✓ {count} installed, none active"
+    check("Presets", _check_presets)
+
+
+    console.print("  [dim]── System ──[/]")
+    def _check_disk():
+        import shutil
+        total, used, free = shutil.disk_usage(".")
+        free_gb = free / (1024**3)
+        if free_gb < 1:
+            return f"⚠ only {free_gb:.1f}GB free"
+        return f"✓ {free_gb:.1f}GB free"
+    check("Disk", _check_disk)
+
+
+    def _check_logs():
+        log_path = config.LOGS_DIR / "castor.log"
+        if not log_path.exists():
+            return "⚠ no log file"
+        size_kb = log_path.stat().st_size / 1024
+        return f"✓ {size_kb:.0f}KB"
+    check("Logs", _check_logs)
+
+
+    console.print()
+    total = passed + failed + warnings
+    if failed == 0 and warnings == 0:
+        console.print(f"  [bold green]All {total} checks passed! ⚡[/]")
+    elif failed == 0:
+        console.print(f"  [bold yellow]{passed} passed, {warnings} warnings[/]")
+    else:
+        console.print(f"  [bold red]{passed} passed, {failed} failed, {warnings} warnings[/]")
+    console.print()
+    return failed == 0
+
+
+def _run_update_cli():
+    """Run update from CLI with Rich progress output."""
+    import updater
+
+    console.print("\n  [bold yellow]⚡ castor update[/]\n")
+
+    status_icons = {
+        "checking": "🔍", "running": "⏳", "stashing": "📦",
+        "ok": "[green]✓[/]", "error": "[red]✗[/]",
+        "warning": "[yellow]⚠[/]", "skipped": "[dim]–[/]",
+    }
+    step_names = {
+        "preflight": "Preflight", "fetch": "Check updates", "conflicts": "Skill conflicts",
+        "backup": "Backup database", "pull": "Pull code", "deps": "Dependencies",
+        "migrate": "Migrations", "done": "Complete",
+    }
+
+    def on_progress(step, status, detail=""):
+        icon = status_icons.get(status, "·")
+        name = step_names.get(step, step)
+        if detail:
+            console.print(f"  {icon} {name}: {detail}")
+        else:
+            console.print(f"  {icon} {name}")
+
+    result = updater.perform_update(on_progress=on_progress)
+    console.print()
+
+    if result["success"]:
+        if result["restart_needed"]:
+            console.print(f"  [bold green]⚡ Updated: v{result['old_version']} → v{result['new_version']}[/]")
+            console.print(f"  [dim]Restart castor to use the new version.[/]\n")
+        else:
+            console.print(f"  [green]Already up to date (v{result['new_version']})[/]\n")
+    else:
+        console.print(f"  [bold red]Update failed:[/] {result.get('error', 'Unknown error')}\n")
+
+    sys.exit(0 if result["success"] else 1)
+
+
+def _preset_cli(argv: list[str]) -> int:
+    """Non-interactive `castor preset <action> [args]` command.
+
+    Thin plain-text formatter over `_preset_exec`. Used by the argparse
+    subcommand — prints to stdout/stderr so output is pipe-friendly.
+    """
+    if not argv:
+        argv = ["list"]
+    action = argv[0]
+    rest = " ".join(argv[1:])
+
+    result = _preset_exec(action, rest)
+    kind = result["kind"]
+
+    if kind == "list":
+        items = result["items"]
+        if not items:
+            print("No presets installed.")
+            return 0
+        for it in items:
+            marker = "●" if it["active"] else "○"
+            print(f"{marker} {it['id']}  v{it['version']}  [{it['category']}]  {it['name']}")
+        if result["active"]:
+            print(f"\nActive: {result['active']}")
+        return 0
+
+    if kind == "install_ok":
+        r = result["result"]
+        print(f"✓ Installed {r['name']} v{r['version']} ({r['category']})")
+        print(f"  {r['path']}")
+        return 0
+
+    if kind == "validation":
+        print("Validation failed:", file=sys.stderr)
+        for err in result["errors"]:
+            print(f"  - {err}", file=sys.stderr)
+        return 1
+
+    if kind == "activate_ok":
+        print(f"✓ Activated: {result['name']} ({result['id']})")
+        return 0
+
+    if kind == "deactivate_ok":
+        print(f"✓ Deactivated: {result['id']}")
+        return 0
+
+    if kind == "deactivate_noop":
+        print("No preset active.")
+        return 0
+
+    if kind == "info":
+        info = result["info"]
+        m = info["manifest"]
+        print(f"{info['name']} v{info['version']}")
+        print(f"  id:       {info['id']}")
+        print(f"  category: {info['category']}")
+        print(f"  author:   {info['author_name']}")
+        print(f"  license:  {info['license_type']}")
+        desc = (m.get("description") or {}).get("short", "")
+        if desc:
+            print(f"  desc:     {desc}")
+        if info["active"]:
+            print("  ● currently active")
+        return 0
+
+    if kind == "rm_ok":
+        print(f"✓ Uninstalled: {result['id']}")
+        return 0
+
+    if kind == "usage":
+        print(f"usage: castor preset {result['usage']}", file=sys.stderr)
+        return 2
+
+    if kind == "error":
+        prefix = "" if result.get("already") else "✗ "
+        print(f"{prefix}{result['message']}", file=sys.stderr)
+        return result.get("exit_code", 1)
+
+    if kind == "trust_list":
+        keys = result["keys"]
+        if not keys:
+            print("Trust store is empty.")
+            return 0
+        for k in keys:
+            print(f"● {k['fingerprint']}")
+        return 0
+
+    if kind == "trust_added":
+        print(f"✓ Trusted {result['fingerprint']}  ({result['path']})")
+        return 0
+
+    if kind == "trust_removed":
+        print(f"✓ Removed {result['fingerprint']}")
+        return 0
+
+    if kind == "policy_show":
+        print(f"policy: {result['policy']}")
+        return 0
+
+    if kind == "policy_set":
+        print(f"✓ Policy set to: {result['policy']}")
+        return 0
+
+    if kind == "unknown":
+        print(f"Unknown preset action: {result['action']}", file=sys.stderr)
+        print("Actions: list, install, activate, deactivate, info, rm, trust, policy",
+              file=sys.stderr)
+        return 2
+
+    print(f"Unhandled preset result kind: {kind}", file=sys.stderr)
+    return 2
+
+
+def main_entry():
+    """Unified entry point: `castor` for CLI, `castor --web` for web server."""
+    import argparse
+
+
+    if len(sys.argv) >= 2 and sys.argv[1] == "preset":
+        sys.exit(_preset_cli(sys.argv[2:]))
+
+    parser = argparse.ArgumentParser(description="castor — offline AI agent")
+    parser.add_argument("--web", action="store_true", help="Start web server instead of CLI")
+    parser.add_argument("--doctor", action="store_true", help="Run diagnostics")
+    parser.add_argument("--update", action="store_true", help="Update to latest version")
+    parser.add_argument("--setup-inference", action="store_true", help="Setup inference backend (Ollama)")
+    parser.add_argument("--host", default="0.0.0.0", help="Web server host (default: 0.0.0.0)")
+    parser.add_argument("--port", type=int, default=7860, help="Web server port (default: 7860)")
+    parser.add_argument("--ssl", action="store_true", help="Serve over HTTPS (self-signed cert, needed for camera on mobile)")
+    parser.add_argument("--export-config", action="store_true", help="Export settings to JSON (stdout)")
+    parser.add_argument("--import-config", type=str, metavar="FILE", help="Import settings from JSON file")
+    args = parser.parse_args()
+
+    if args.export_config:
+        import json
+        import config
+        print(json.dumps(config.export_config(), indent=2, ensure_ascii=False))
+    elif args.import_config:
+        import json
+        import config
+        from pathlib import Path
+        data = json.loads(Path(args.import_config).read_text())
+        results = config.import_config(data)
+        for r in results:
+            print(r)
+        print(f"\n{len(results)} settings applied.")
+    elif args.update:
+        _run_update_cli()
+    elif args.setup_inference:
+        import inference_setup
+        inference_setup.run_wizard()
+    elif args.doctor:
+        doctor()
+    elif args.web:
+        import server
+        server.start(host=args.host, port=args.port, ssl=args.ssl)
+    else:
+        main()
+
+
+if __name__ == "__main__":
+    main_entry()

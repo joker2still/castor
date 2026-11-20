@@ -1,0 +1,4406 @@
+"""Web server for castor — FastAPI + WebSocket chat."""
+
+import faulthandler
+import sys
+import signal
+faulthandler.enable(file=sys.stderr)
+
+def _signal_handler(signum, frame):
+    import traceback
+    import logger as _lg
+    _l = _lg.get("server")
+    _l.error(f"SIGNAL {signum} received!")
+    _l.error("".join(traceback.format_stack(frame)))
+    # Flush WAL so the DB is not left with an open write transaction
+    try:
+        import db as _db
+        _db.graceful_shutdown()
+    except Exception:
+        pass
+
+signal.signal(signal.SIGTERM, _signal_handler)
+signal.signal(signal.SIGINT, _signal_handler)
+
+import asyncio
+import base64
+import functools
+import hashlib
+import hmac
+import ipaddress
+import json
+import re
+import shutil
+import socket
+import subprocess
+import time
+import os
+import threading
+import ssl
+import urllib.request
+import uuid
+
+try:
+    import certifi as _certifi
+    _SSL_CTX = ssl.create_default_context(cafile=_certifi.where())
+except ImportError:
+    _SSL_CTX = ssl.create_default_context()
+from pathlib import Path
+from contextlib import asynccontextmanager
+from urllib.parse import urlparse
+
+import requests
+
+
+import discovery
+import mcp_client
+import presets
+import rag
+import scheduler
+import skills
+import stt
+import tasks
+import tools
+import tts
+import updater
+import vault
+from turn_context import TurnContext
+
+
+_abort_event = threading.Event()
+
+
+_cost_tracking_first_use_seen = False
+
+
+_auto_resume_first_use_seen = False
+
+
+import threading as _threading
+_ws_clients: set = set()
+_ws_lock = _threading.Lock()
+_ws_loop: asyncio.AbstractEventLoop | None = None
+
+
+_ws_abort_events: set[threading.Event] = set()
+_ws_abort_lock = threading.Lock()
+
+
+_knowledge_task: dict | None = None
+_knowledge_lock = threading.Lock()
+
+
+from collections import deque as _deque
+_knowledge_history: _deque = _deque(maxlen=20)
+
+
+def _push_history(entry: dict):
+    """Record a completed indexing run for /api/knowledge/recent."""
+    entry.setdefault("ts", time.time())
+    _knowledge_history.appendleft(entry)
+
+
+_pending_frame_requests: dict = {}
+
+
+_pending_canvas_prompts: dict = {}
+
+
+_pending_canvas_renders: dict[str, list[dict]] = {}
+_CANVAS_META_HTML_CAP = 64 * 1024
+
+
+_RESUME_LOCK = threading.Lock()
+_RESUME_IN_FLIGHT: dict[int, bool] = {}
+
+from fastapi import BackgroundTasks, FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, JSONResponse, Response
+
+import config
+import db
+import soul
+import logger
+import memory as mem
+import providers
+import threads
+
+_log = logger.get("server")
+
+
+def _recover_interrupted_runs_on_startup() -> None:
+    """Mark orphaned 'running' agent_runs as 'aborted' at server start.
+
+    Synthesizes an abort marker in messages so the run appears interrupted
+    in the UI. Does NOT auto-resume — Web banner / Telegram /resume /
+    scheduler auto-fire handle user-facing recovery. Must run BEFORE
+    scheduler.start() so scheduler.detect_missed_runs sees the up-to-date
+    'aborted' rows for its 5-min auto-fire window.
+    """
+    try:
+        rows = db._get_conn().execute(
+            "SELECT id, thread_id FROM agent_runs WHERE status='running'"
+        ).fetchall()
+    except Exception as e:
+        _log.warning(f"crash-recovery query failed: {e}")
+        return
+    for (rid, thread_id) in rows:
+        try:
+            db.save_message(
+                role="assistant", content="",
+                thread_id=thread_id,
+                meta={"interrupted": True, "run_id": rid,
+                      "crash_recovery": True},
+            )
+        except Exception as e:
+            _log.debug(f"crash-recovery save_message failed for #{rid}: {e}")
+        try:
+            db.finalize_agent_run(
+                rid, finished_at=None, duration_ms=None,
+                status="aborted", error="server restart",
+            )
+        except Exception as e:
+            _log.debug(f"crash-recovery finalize failed for #{rid}: {e}")
+    if rows:
+        _log.info(f"recovered {len(rows)} interrupted runs from previous session")
+
+
+def _validate_home_path(raw: str) -> Path:
+    """Validate path is within user's home directory. Raises ValueError if not."""
+    home = Path.home().resolve()
+    p = Path(raw).expanduser().resolve()
+    try:
+        p.relative_to(home)
+    except ValueError:
+        raise ValueError(f"Access denied: path outside home directory")
+    if not p.exists():
+        raise FileNotFoundError(f"Path not found: {raw}")
+    return p
+
+
+def _friendly_error(e: Exception) -> str:
+    """Convert raw exceptions to user-friendly messages."""
+    err = str(e).lower()
+    if "connection" in err and ("refused" in err or "failed" in err or "error" in err):
+        return "⚠️ Cannot connect to LLM server. Make sure LM Studio or Ollama is running."
+    if "timeout" in err:
+        return "⚠️ LLM server timed out. The model may still be loading — try again in a moment."
+    if "401" in err or "unauthorized" in err or "authentication" in err:
+        return "⚠️ Authentication failed. Check your API key in Settings → Provider."
+    if "404" in err and "model" in err:
+        return "⚠️ Model not found. Load the model in LM Studio or check the model name in Settings."
+    if "rate" in err and "limit" in err:
+        return "⚠️ Rate limit exceeded. Wait a moment and try again."
+    if "context" in err and ("length" in err or "too long" in err):
+        return "⚠️ Message too long for model context. Try a shorter message or clear history."
+
+    msg = str(e)
+    if len(msg) > 200:
+        msg = msg[:200] + "…"
+    return f"⚠️ Error: {msg}"
+
+
+def _emit_agent_status(text: str):
+    """Broadcast live status update from agent thread to WS clients."""
+    if _ws_loop and _ws_clients:
+        try:
+            asyncio.run_coroutine_threadsafe(
+                _broadcast({"type": "status", "text": text}), _ws_loop
+            )
+        except Exception:
+            pass
+
+
+def _emit_agent_thinking(text: str):
+    """Broadcast live thinking chunk from agent thread to WS clients."""
+    if _ws_loop and _ws_clients:
+        try:
+            asyncio.run_coroutine_threadsafe(
+                _broadcast({"type": "thinking_delta", "text": text}), _ws_loop
+            )
+        except Exception:
+            pass
+
+
+def _emit_agent_content(text: str):
+    """Broadcast live content (reply) chunk from agent thread to WS clients."""
+    if _ws_loop and _ws_clients:
+        try:
+            asyncio.run_coroutine_threadsafe(
+                _broadcast({"type": "content_delta", "text": text}), _ws_loop
+            )
+        except Exception:
+            pass
+
+
+def _run_agent_sync(user_input: str, thread_id: str | None = None,
+                    image_b64: str | None = None,
+                    image_path: str | None = None,
+                    file_meta: dict | None = None,
+                    abort_event: threading.Event | None = None,
+                    ctx: "TurnContext | None" = None) -> dict:
+    """Run agent.run() synchronously — called from thread pool.
+
+    ``ctx``: optional per-request :class:`turn_context.TurnContext`.
+    ``abort_event``: legacy per-request event. When both are None, the legacy
+    shared module event is used (for /api/abort + older callers). WebSocket
+    sessions pass their own event / ctx so one client's disconnect doesn't
+    abort another's turn.
+    """
+    import agent
+    from turn_context import TurnContext
+
+
+    if ctx is None:
+        if abort_event is None:
+
+
+            _abort_event.clear()
+            abort_event = _abort_event
+        else:
+            abort_event.clear()
+        ctx = TurnContext(
+            abort_event=abort_event,
+            source="web",
+            image_path=image_path,
+            file_meta=file_meta,
+
+
+            on_status=_emit_agent_status,
+            on_thinking=_emit_agent_thinking,
+            on_content=_emit_agent_content,
+        )
+    else:
+
+
+        ctx.source = ctx.source or "web"
+        if image_path is not None:
+            ctx.image_path = image_path
+        if file_meta is not None:
+            ctx.file_meta = file_meta
+        if ctx.abort_event is not None:
+            ctx.abort_event.clear()
+    t0 = time.time()
+    result = agent.run(user_input, thread_id=thread_id, source=ctx.source,
+                       image_b64=image_b64, ctx=ctx)
+    elapsed = int((time.time() - t0) * 1000)
+    return {
+        "reply": result.reply,
+        "thinking": result.thinking,
+        "tools": result.tool_calls_made,
+        "duration_ms": elapsed,
+        "context_hits": result.auto_context_hits,
+        "thread_id": thread_id or threads.get_active_id(),
+        "model_used": result.model,
+        "tokens": getattr(result, "completion_tokens", 0),
+        "prompt_tokens": getattr(result, "prompt_tokens", 0),
+        "tok_per_sec": getattr(result, "tok_per_sec", 0),
+    }
+
+
+def _sweep_uploads(max_age_days: int = 14, max_files: int = 10000) -> tuple[int, int]:
+    """Delete files under config.UPLOADS_DIR older than ``max_age_days``.
+
+    Protects ``uploads/kb/`` — those files back indexed knowledge sources and
+    must live until the user deletes them from the KB list. Bounded at
+    ``max_files`` inspected files so a pathological uploads dir can't stall
+    startup. Returns (files_deleted, bytes_freed).
+    """
+    upl = config.UPLOADS_DIR
+    if not upl.exists():
+        return 0, 0
+    cutoff = time.time() - (max_age_days * 86400)
+    deleted = 0
+    bytes_freed = 0
+    inspected = 0
+    kb_dir = (upl / "kb").resolve()
+
+    try:
+        for p in upl.rglob("*"):
+            inspected += 1
+            if inspected > max_files:
+                _log.warning(f"uploads sweep: hit {max_files}-file cap, stopping")
+                break
+            if not p.is_file():
+                continue
+
+
+            try:
+                rp = p.resolve()
+                if kb_dir in rp.parents or rp == kb_dir:
+                    continue
+            except Exception:
+                pass
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            if st.st_mtime >= cutoff:
+                continue
+            try:
+                size = st.st_size
+                p.unlink()
+                deleted += 1
+                bytes_freed += size
+            except OSError as e:
+                _log.warning(f"uploads sweep: could not delete {p}: {e}")
+    except Exception as e:
+        _log.warning(f"uploads sweep failed: {e}")
+    return deleted, bytes_freed
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+
+    try:
+        db.check_and_restore()
+    except Exception as e:
+        _log.warning(f"db integrity check startup: {e}")
+    try:
+        db.start_backup_scheduler()
+    except Exception as e:
+        _log.warning(f"db backup scheduler startup: {e}")
+
+    tz_val = db.kv_get("tz_offset") or db.kv_get("timezone")
+    if tz_val:
+        try:
+            config.TZ_OFFSET = int(tz_val)
+        except (ValueError, TypeError):
+            pass
+
+    try:
+        n, b = _sweep_uploads()
+        if n:
+            _log.info(f"uploads sweep: deleted {n} file(s), freed {b} bytes")
+    except Exception as e:
+        _log.warning(f"uploads sweep error: {e}")
+
+    try:
+        active_preset = presets.get_active()
+        if active_preset:
+            presets.ensure_preset_workspace(active_preset)
+    except Exception:
+        pass
+
+
+    try:
+        _recover_interrupted_runs_on_startup()
+    except Exception as e:
+        _log.warning(f"crash-recovery startup: {e}")
+    scheduler.start()
+
+    try:
+        import pricing
+        pricing.start_background_refresher()
+    except Exception as e:
+        _log.warning(f"pricing startup: {e}")
+
+    try:
+        mcp_client.start_all()
+    except Exception as e:
+        _log.warning(f"MCP startup: {e}")
+
+    try:
+        if telegram_bot.is_enabled() and telegram_bot.get_token():
+            telegram_bot.start(on_message=_telegram_handler)
+    except Exception as e:
+        _log.warning(f"Telegram startup: {e}")
+
+
+    app.state._worker_shutdown = None
+    app.state._worker_task = None
+    if config.get("worker_inline"):
+        try:
+            import worker
+            app.state._worker_shutdown = asyncio.Event()
+            app.state._worker_task = asyncio.create_task(
+                worker.start_inline(app.state._worker_shutdown)
+            )
+            _log.info("inline goal worker started")
+        except Exception as e:
+            _log.exception(f"inline worker startup failed: {e}")
+
+    _log.info("web server started")
+
+
+    try:
+        _emit_session_start_telemetry(source="web")
+    except Exception as e:
+        _log.warning(f"telemetry session_start: {e}")
+    yield
+
+
+    try:
+        if app.state._worker_shutdown is not None:
+            app.state._worker_shutdown.set()
+        if app.state._worker_task is not None:
+            try:
+                await asyncio.wait_for(app.state._worker_task, timeout=30)
+            except asyncio.TimeoutError:
+                _log.warning("inline worker didn't stop within 30s; cancelling")
+                app.state._worker_task.cancel()
+    except Exception:
+        _log.exception("inline worker shutdown error")
+    try:
+        telegram_bot.stop()
+    except Exception:
+        pass
+    try:
+        mcp_client.stop_all()
+    except Exception:
+        pass
+    try:
+        db.graceful_shutdown()
+    except Exception:
+        pass
+    _log.info("web server stopped")
+
+
+def _emit_session_start_telemetry(source: str) -> None:
+    """Build and emit the session_start event.
+
+    Imported lazily so importing server.py in tests doesn't trigger a
+    spurious event. All inputs are coerced into the bounded enum / bucket
+    space defined in telemetry.ALLOWED_EVENTS — anything we can't classify
+    cleanly defaults to "unknown" / 0 / False, never raw strings.
+    """
+    import telemetry
+    if not telemetry.enabled():
+        return
+    try:
+        import telegram_bot as _tg
+        has_telegram = bool(_tg.is_enabled() and _tg.get_token())
+    except Exception:
+        has_telegram = False
+    try:
+        has_camera = int(config.get("camera_index")) >= 0
+    except Exception:
+        has_camera = False
+    try:
+        has_voice = bool(config.get("tts_enabled")) or bool(stt.is_available())
+    except Exception:
+        has_voice = False
+    try:
+        scheduled_jobs_count = len(scheduler.list_tasks())
+    except Exception:
+        scheduled_jobs_count = 0
+    try:
+        active_skills_count = len(skills.get_active())
+    except Exception:
+        active_skills_count = 0
+    try:
+
+        indexed_sources_count = int(rag.get_status().get("files", 0))
+    except Exception:
+        try:
+            row = db.fetchone(
+                "SELECT COUNT(*) FROM kv WHERE key LIKE 'rag:mtime:%'"
+            )
+            indexed_sources_count = int(row[0]) if row else 0
+        except Exception:
+            indexed_sources_count = 0
+    try:
+        has_mcp = bool(mcp_client.list_servers())
+    except Exception:
+        has_mcp = False
+    provider_kind = telemetry.provider_kind_from_name(providers.get_active_name())
+
+
+    model_size_bucket = telemetry.bucket_model_size(None)
+    telemetry.track_event("session_start", {
+        "castor_version": str(config.VERSION),
+        "python_version": telemetry.python_version(),
+        "os": telemetry.os_kind(),
+        "provider_kind": provider_kind,
+        "model_size_bucket": model_size_bucket,
+        "has_web_ui": source == "web",
+        "has_telegram": has_telegram,
+        "has_voice": has_voice,
+        "has_camera": has_camera,
+        "has_scheduler": True,
+        "has_mcp": has_mcp,
+        "active_skills_count": int(active_skills_count),
+        "scheduled_jobs_count": int(scheduled_jobs_count),
+        "indexed_sources_count": int(indexed_sources_count),
+    })
+
+
+app = FastAPI(title="castor", version="0.3.0", lifespan=lifespan)
+
+
+_AUTH_PASSWORD = os.environ.get("CASTOR_PASSWORD", "")
+_AUTH_COOKIE = "castor_auth"
+
+
+_AUTH_TOKEN = (
+    hmac.new(b"castor-auth-v1", _AUTH_PASSWORD.encode(), hashlib.sha256).hexdigest()[:32]
+    if _AUTH_PASSWORD else ""
+)
+
+
+_MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+
+
+_PATH_RE = re.compile(r"[A-Za-z]:\\[^\s,;:\"'<>()]+|/(?:home|root|Users|var|tmp|usr|etc)/[^\s,;:\"'<>()]+")
+
+
+def _sanitize_err(e: Exception) -> str:
+    """Return *str(e)* with filesystem paths replaced by '[path]'."""
+    return _PATH_RE.sub("[path]", str(e))
+
+
+_rate_log: dict[str, list[float]] = {}
+_RATE_LIMIT = 120
+
+
+def _check_rate_limit(ip: str) -> bool:
+    """Returns True if request is allowed."""
+    now = time.time()
+    timestamps = _rate_log.get(ip, [])
+
+    timestamps = [t for t in timestamps if now - t < 60]
+    if not timestamps:
+        _rate_log.pop(ip, None)
+        _rate_log[ip] = [now]
+        return True
+    if len(timestamps) >= _RATE_LIMIT:
+        _rate_log[ip] = timestamps
+        return False
+    timestamps.append(now)
+    _rate_log[ip] = timestamps
+    return True
+
+
+@app.middleware("http")
+async def auth_and_rate_middleware(request: Request, call_next):
+    """Optional password auth + rate limiting middleware."""
+    path = request.url.path
+
+
+    if path in ("/api/login", "/static") or path.startswith("/static/"):
+        return await call_next(request)
+
+
+    client_ip = request.client.host if request.client else "unknown"
+    if not _check_rate_limit(client_ip):
+        return JSONResponse({"error": "rate limit exceeded"}, status_code=429)
+
+
+    if _AUTH_PASSWORD:
+
+        if path == "/" and request.method == "GET":
+            cookie = request.cookies.get(_AUTH_COOKIE, "")
+            if not hmac.compare_digest(cookie, _AUTH_TOKEN):
+
+                return await call_next(request)
+
+
+        if path.startswith("/api/") or path.startswith("/ws"):
+            cookie = request.cookies.get(_AUTH_COOKIE, "")
+            if not hmac.compare_digest(cookie, _AUTH_TOKEN):
+                return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    return await call_next(request)
+
+
+@app.post("/api/login")
+async def login(request: Request):
+    """Authenticate with password. Sets auth cookie."""
+    if not _AUTH_PASSWORD:
+        return {"ok": True, "message": "no password set"}
+    body = await request.json()
+    password = body.get("password", "")
+    if hmac.compare_digest(password, _AUTH_PASSWORD):
+        response = JSONResponse({"ok": True})
+        response.set_cookie(_AUTH_COOKIE, _AUTH_TOKEN,
+                            max_age=86400, httponly=True, samesite="strict")
+        return response
+    return JSONResponse({"error": "wrong password"}, status_code=401)
+
+
+STATIC_DIR = Path(__file__).parent / "static"
+if STATIC_DIR.exists():
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+UPLOADS_DIR = config.UPLOADS_DIR
+app.mount("/uploads", StaticFiles(directory=str(UPLOADS_DIR)), name="uploads")
+
+
+from dataclasses import dataclass as _dataclass
+
+
+@_dataclass
+class StagedUpload:
+    """Result of `_stage_upload()` — one file + any extra string form fields."""
+    path: Path
+    name: str
+    size: int
+    ext: str
+    extras: dict
+
+
+def _safe_print(text: str) -> None:
+    """Print with fallback for terminals that can't render unicode (e.g. cp1251)."""
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        print(text.encode("ascii", errors="ignore").decode("ascii"))
+
+
+def _get_lan_ip() -> str | None:
+    """Discover this machine's LAN IP via a UDP connect to 8.8.8.8."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+    except Exception:
+        return None
+
+
+async def _stage_upload(request: Request, subdir: str, default_name: str = "file"
+                        ) -> StagedUpload | JSONResponse:
+    """Validate a multipart upload, sanitize the filename, stage it under
+    ``UPLOADS_DIR/<subdir>/<uuid>_<name>``, and return a ``StagedUpload``.
+
+    Returns a JSONResponse with an appropriate status code on failure so
+    callers can simply::
+
+        staged = await _stage_upload(request, "presets")
+        if isinstance(staged, JSONResponse):
+            return staged
+        # staged is a StagedUpload
+
+    Form parsing + file reading are both confined to this helper. Once it
+    returns, no Starlette form or UploadFile objects remain reachable, so
+    their temp files are released promptly.
+    """
+    content_type = request.headers.get("content-type", "")
+    if "multipart" not in content_type:
+        return JSONResponse({"error": "multipart/form-data required"}, status_code=400)
+
+    form = await request.form()
+    try:
+        file = form.get("file")
+        if not file:
+            return JSONResponse({"error": "no file"}, status_code=400)
+
+        data = await file.read(_MAX_UPLOAD_BYTES + 1)
+        if len(data) > _MAX_UPLOAD_BYTES:
+            return JSONResponse(
+                {"error": f"file too large (max {_MAX_UPLOAD_BYTES // 1024 // 1024}MB)"},
+                status_code=413,
+            )
+
+        fname_raw = getattr(file, "filename", None) or default_name
+
+        fname_safe = re.sub(r'[^\w.\-]+', '_', Path(fname_raw).name)[:100] or default_name
+        stem = Path(fname_safe).stem
+        ext = Path(fname_safe).suffix or ""
+
+        target_dir = UPLOADS_DIR / subdir
+        target_dir.mkdir(parents=True, exist_ok=True)
+        doc_id = uuid.uuid4().hex[:8]
+        save_path = target_dir / f"{doc_id}_{stem}{ext}"
+        save_path.write_bytes(data)
+
+
+        extras = {
+            k: str(v)
+            for k, v in form.multi_items()
+            if k != "file" and isinstance(v, str)
+        }
+
+        return StagedUpload(
+            path=save_path,
+            name=fname_raw,
+            size=len(data),
+            ext=ext,
+            extras=extras,
+        )
+    finally:
+
+        try:
+            await form.close()
+        except Exception:
+            pass
+
+
+@app.post("/api/upload")
+async def upload_image(request: Request):
+    """Upload an image file. Returns image_id for use in chat."""
+    content_type = request.headers.get("content-type", "")
+
+    if "multipart" in content_type:
+        form = await request.form()
+        file = form.get("file")
+        if not file:
+            return JSONResponse({"error": "no file"}, status_code=400)
+        data = await file.read(_MAX_UPLOAD_BYTES + 1)
+        if len(data) > _MAX_UPLOAD_BYTES:
+            return JSONResponse({"error": f"file too large (max {_MAX_UPLOAD_BYTES // 1024 // 1024}MB)"}, status_code=413)
+        filename = file.filename or "image.png"
+    else:
+
+        body = await request.json()
+        data = base64.b64decode(body.get("data", ""))
+        if len(data) > _MAX_UPLOAD_BYTES:
+            return JSONResponse({"error": f"file too large (max {_MAX_UPLOAD_BYTES // 1024 // 1024}MB)"}, status_code=413)
+        filename = body.get("filename", "image.png")
+
+
+    ext = Path(filename).suffix.lower()
+    if ext not in (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"):
+        return JSONResponse({"error": "unsupported image format"}, status_code=400)
+
+
+    image_id = str(uuid.uuid4())[:8]
+    save_path = UPLOADS_DIR / f"{image_id}{ext}"
+    save_path.write_bytes(data)
+
+    # Return base64 for immediate use (no absolute path — security)
+    b64 = base64.b64encode(data).decode()
+    _log.info(f"image uploaded: {image_id} ({len(data)} bytes)")
+    return {"image_id": image_id, "b64": b64}
+
+
+@app.post("/api/transcribe")
+async def transcribe_audio(request: Request):
+    """Transcribe audio to text via STT."""
+    if not stt.is_available():
+        return JSONResponse({"error": "STT not available. Install: pip install faster-whisper"}, status_code=503)
+
+
+    try:
+        import telemetry as _tel
+        _tel.track_feature_first_use("live_voice")
+    except Exception:
+        pass
+
+    content_type = request.headers.get("content-type", "")
+    if "multipart" in content_type:
+        form = await request.form()
+        file = form.get("file")
+        if not file:
+            return JSONResponse({"error": "no file"}, status_code=400)
+        data = await file.read(_MAX_UPLOAD_BYTES + 1)
+        if len(data) > _MAX_UPLOAD_BYTES:
+            return JSONResponse({"error": "file too large"}, status_code=413)
+        filename = file.filename or "audio.webm"
+    else:
+        body = await request.json()
+        data = base64.b64decode(body.get("audio_b64", ""))
+        if len(data) > _MAX_UPLOAD_BYTES:
+            return JSONResponse({"error": "file too large"}, status_code=413)
+        filename = f"audio.{body.get('format', 'webm')}"
+
+    fmt = Path(filename).suffix.lstrip(".") or "webm"
+    loop = asyncio.get_event_loop()
+    try:
+        text = await loop.run_in_executor(
+            None, functools.partial(stt.transcribe, data, format=fmt)
+        )
+    except Exception as e:
+        _log.error(f"transcription error: {e}", exc_info=True)
+        return JSONResponse({"error": _sanitize_err(e)}, status_code=500)
+
+    if text.startswith("[STT Error]"):
+        return JSONResponse({"error": text}, status_code=500)
+    return {"text": text}
+
+
+@app.post("/api/tts")
+async def text_to_speech(request: Request):
+    """Synthesize text to audio via Fish Audio TTS."""
+    if not tts.is_available():
+        return JSONResponse({"error": "TTS not configured"}, status_code=503)
+
+    body = await request.json()
+    text = body.get("text", "").strip()
+    if not text:
+        return JSONResponse({"error": "empty text"}, status_code=400)
+
+    loop = asyncio.get_event_loop()
+    audio = await loop.run_in_executor(
+        None, functools.partial(tts.synthesize, text, format="wav")
+    )
+    if not audio:
+        return JSONResponse({"error": "TTS synthesis failed"}, status_code=500)
+
+    return Response(content=audio, media_type="audio/mpeg",
+                    headers={"Content-Disposition": "inline; filename=voice.mp3"})
+
+
+@app.get("/api/voice/status")
+async def voice_status():
+    """Check STT/TTS availability with details."""
+
+    has_whisper = stt._check_faster_whisper()
+
+    has_ffmpeg_cli = shutil.which("ffmpeg") is not None
+    try:
+        import av  # noqa: F401  # lazy: PyAV is optional, only used for ffmpeg fallback
+        has_pyav = True
+    except ImportError:
+        has_pyav = False
+    has_ffmpeg = has_ffmpeg_cli or has_pyav
+    return {
+        "stt": stt.is_available(),
+        "tts": tts.is_available(),
+        "has_whisper": has_whisper,
+        "has_ffmpeg": has_ffmpeg,
+        "has_pyav": has_pyav,
+        "has_ffmpeg_cli": has_ffmpeg_cli,
+        "stt_model": config.get("stt_model"),
+        "stt_language": config.get("stt_language"),
+        "stt_backend": config.get("stt_backend"),
+        "stt_api_url": config.get("stt_api_url"),
+        "stt_api_model": config.get("stt_api_model"),
+        "stt_openai_key": bool(config.get("stt_openai_key")),
+        "tts_enabled": str(config.get("tts_enabled")) == "1",
+        "tts_api_url": config.get("tts_api_url"),
+        "tts_api_model": config.get("tts_api_model"),
+        "tts_api_voice": config.get("tts_api_voice"),
+        "tts_api_key": bool(config.get("tts_api_key")),
+        "tts_ref_audio": config.get("tts_ref_audio"),
+        "tts_ref_text": config.get("tts_ref_text"),
+    }
+
+
+@app.post("/api/voice/install-whisper")
+async def install_whisper():
+    """Install faster-whisper via pip."""
+    try:
+        proc = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: subprocess.run(
+                [sys.executable, "-m", "pip", "install", "faster-whisper"],
+                capture_output=True, text=True, timeout=300
+            )
+        )
+        if proc.returncode == 0:
+
+            stt._HAS_FASTER_WHISPER = None
+            stt._check_faster_whisper()
+            return {"ok": True, "message": "faster-whisper installed successfully"}
+        return {"ok": False, "error": proc.stderr[:500]}
+    except Exception as e:
+        return {"ok": False, "error": _sanitize_err(e)}
+
+
+@app.get("/api/voice/mode")
+async def get_voice_mode():
+    """Get voice mode state."""
+    enabled = db.kv_get("voice_mode:web") == "1"
+    return {"enabled": enabled}
+
+
+@app.post("/api/voice/mode")
+async def toggle_voice_mode():
+    """Toggle voice mode for web UI."""
+    current = db.kv_get("voice_mode:web") == "1"
+    new_val = not current
+    if new_val and not tts.is_available():
+        return {"enabled": False, "error": "TTS not available. Configure model in Settings → Voice."}
+    db.kv_set("voice_mode:web", "1" if new_val else "0")
+    return {"enabled": new_val}
+
+
+@app.get("/")
+async def index():
+    """Serve the chat UI."""
+    index_path = STATIC_DIR / "index.html"
+    if index_path.exists():
+        return FileResponse(index_path, headers={"Cache-Control": "no-cache"})
+    return JSONResponse({"error": "static/index.html not found"}, status_code=404)
+
+
+@app.get("/api/status")
+async def status():
+    """Agent status — soul, stats, skills."""
+    s = soul.load()
+    s_compl = int(db.kv_get("session_completion_tokens") or "0")
+    s_turns = int(db.kv_get("session_turns") or "0")
+    mem_count = 0
+    try:
+        mem_count = mem.count()
+    except Exception:
+        pass
+
+    active_skills = sorted(skills.get_active())
+
+
+    core_tools = sorted(t["function"]["name"] for t in tools.TOOLS)
+
+    active_thread = threads.get(threads.get_active_id())
+
+
+    try:
+        extended_tools = tools.get_thread_extended_tools(threads.get_active_id())
+    except Exception:
+        extended_tools = []
+
+
+    context_budget = int(config.get("context_budget") or 24000)
+
+    override = int(config.get("model_context") or 0)
+    detected = 0
+    if override <= 0:
+        try:
+            detected = providers.detect_context_length()
+        except Exception:
+            detected = 0
+    model_ctx = override or detected
+
+    return {
+        "agent": s["name"],
+        "model": providers.get_model(),
+        "provider": providers.get_active_name(),
+        "thread": active_thread,
+        "language": s["language"],
+        "soul": {k: v for k, v in s.items() if k not in ("name", "language")},
+        "tokens": s_compl,
+        "turns": s_turns,
+        "memories": mem_count,
+        "skills": active_skills,
+        "core_tools": core_tools,
+        "extended_tools": extended_tools,
+        "context_budget": context_budget,
+        "model_context": model_ctx,
+        "model_context_source": "override" if override else ("detected" if detected else "unknown"),
+    }
+
+
+def _check_version_sync() -> dict:
+    """Check current version vs latest GitHub release (sync, for thread pool)."""
+
+    try:
+        current = updater._current_version()
+    except Exception:
+        try:
+            import importlib.metadata
+            current = importlib.metadata.version("castor")
+        except Exception:
+            current = app.version
+
+
+    cached = db.kv_get("version:latest")
+    cached_at = db.kv_get("version:checked_at")
+    now = time.time()
+
+    latest = cached
+
+    if not cached or not cached_at or (now - float(cached_at)) > 21600:
+        try:
+            req = urllib.request.Request(
+                "https://api.github.com/repos/joker2still/castor/releases/latest",
+                headers={"Accept": "application/vnd.github.v3+json", "User-Agent": "castor"}
+            )
+            with urllib.request.urlopen(req, timeout=5, context=_SSL_CTX) as resp:
+                data = json.loads(resp.read().decode())
+                latest = data.get("tag_name", "").lstrip("v")
+                if latest:
+                    db.kv_set("version:latest", latest)
+                    db.kv_set("version:checked_at", str(now))
+        except Exception as e:
+            _log.debug(f"version check failed: {e}")
+            latest = cached
+
+    update_available = False
+    if latest and current:
+        try:
+
+
+            from packaging.version import Version
+            update_available = Version(latest) > Version(current)
+        except Exception:
+            update_available = latest != current and latest > current
+
+    return {"current": current, "latest": latest, "update_available": update_available}
+
+
+@app.get("/api/version")
+async def version_check():
+    """Check current version vs latest GitHub release."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _check_version_sync)
+
+
+_update_status = {"running": False, "result": None}
+
+@app.get("/api/update/check")
+async def update_check():
+    """Check if update is available (uses git fetch)."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, updater.check)
+
+
+@app.post("/api/update")
+async def trigger_update():
+    """Trigger a full update. Progress broadcast via WebSocket."""
+    if _update_status["running"]:
+        return JSONResponse({"error": "Update already in progress"}, status_code=409)
+
+    def _run():
+        _update_status["running"] = True
+        _update_status["result"] = None
+
+        def on_progress(step, status, detail=""):
+            if _ws_loop and _ws_clients:
+                msg = {"type": "update_progress", "step": step, "status": status, "detail": detail}
+                try:
+                    asyncio.run_coroutine_threadsafe(_broadcast(msg), _ws_loop)
+                except Exception:
+                    pass
+
+        try:
+            result = updater.perform_update(on_progress=on_progress)
+            _update_status["result"] = result
+        except Exception as e:
+            _update_status["result"] = {"success": False, "error": _sanitize_err(e)}
+        finally:
+            _update_status["running"] = False
+
+
+        if _ws_loop and _ws_clients:
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    _broadcast({"type": "update_done", **(_update_status["result"] or {})}),
+                    _ws_loop
+                )
+            except Exception:
+                pass
+
+    threading.Thread(target=_run, daemon=True).start()
+    return {"started": True}
+
+
+@app.get("/api/update/status")
+async def update_status():
+    """Get current update status."""
+    return {"running": _update_status["running"], "result": _update_status["result"]}
+
+
+@app.post("/api/update/restart")
+async def trigger_restart():
+    """Restart the server process after update."""
+    async def _delayed_restart():
+        await asyncio.sleep(1)
+        updater.restart_process()
+
+    asyncio.ensure_future(_delayed_restart())
+    return {"restarting": True}
+
+
+@app.get("/api/stats")
+async def stats():
+    """Agent reliability and usage stats."""
+    raw = db.kv_get_prefix("stats:")
+    return {k.replace("stats:", ""): int(v) for k, v in raw.items()}
+
+
+@app.post("/api/stats/reset")
+async def stats_reset():
+    """Reset all stats counters to zero."""
+    raw = db.kv_get_prefix("stats:")
+    for key in raw:
+        db.kv_set(key, "0")
+    return {"ok": True, "reset": len(raw)}
+
+
+@app.get("/api/user-profile")
+async def get_user_profile():
+    """Get user profile data."""
+    raw = db.kv_get_prefix("user:")
+    return {k.replace("user:", ""): v for k, v in raw.items()}
+
+
+@app.post("/api/user-profile")
+async def update_user_profile(request: Request):
+    """Update or delete user profile fields."""
+    req = await request.json()
+    if "delete" in req:
+        key = req["delete"].strip().lower().replace(" ", "_")
+        db.kv_set(f"user:{key}", "")
+
+        db.execute("DELETE FROM kv WHERE key=?", (f"user:{key}",))
+        return {"ok": True, "deleted": key}
+    key = req.get("key", "").strip().lower().replace(" ", "_")
+    value = req.get("value", "").strip()
+    if not key:
+        return JSONResponse({"error": "key required"}, status_code=400)
+    db.kv_set(f"user:{key}", value)
+    return {"ok": True, "key": key, "value": value}
+
+
+@app.get("/api/heartbeat")
+async def get_heartbeat():
+    """Get heartbeat config and items."""
+    enabled = db.kv_get("heartbeat:enabled") != "0"
+    interval = config.get("heartbeat_interval_min")
+    raw = db.kv_get("heartbeat:items")
+    items = json.loads(raw) if raw else []
+    return {"enabled": enabled, "interval_min": interval, "items": items}
+
+
+@app.post("/api/heartbeat")
+async def update_heartbeat(request: Request):
+    """Manage heartbeat: add/remove items, toggle on/off."""
+    req = await request.json()
+    action = req.get("action", "")
+
+    if action == "add":
+        text = req.get("text", "").strip()[:500]
+        if not text:
+            return JSONResponse({"error": "text required"}, status_code=400)
+        raw = db.kv_get("heartbeat:items")
+        items = json.loads(raw) if raw else []
+        items.append(text)
+        db.kv_set("heartbeat:items", json.dumps(items))
+        return {"ok": True, "items": items}
+
+    if action == "remove":
+        idx = req.get("index", -1)
+        raw = db.kv_get("heartbeat:items")
+        items = json.loads(raw) if raw else []
+        if 0 <= idx < len(items):
+            removed = items.pop(idx)
+            db.kv_set("heartbeat:items", json.dumps(items))
+            return {"ok": True, "removed": removed, "items": items}
+        return JSONResponse({"error": "invalid index"}, status_code=400)
+
+    if action == "toggle":
+        current = db.kv_get("heartbeat:enabled") != "0"
+        new_val = not current
+        db.kv_set("heartbeat:enabled", "1" if new_val else "0")
+        if new_val:
+            scheduler._register_heartbeat()
+        else:
+            scheduler._unregister_heartbeat()
+        return {"ok": True, "enabled": new_val}
+
+    return JSONResponse({"error": "unknown action"}, status_code=400)
+
+
+@app.get("/api/discover")
+async def discover_servers():
+    """Auto-discover LLM servers on localhost."""
+    loop = asyncio.get_event_loop()
+    results = await loop.run_in_executor(None, discovery.discover)
+    return {"servers": results}
+
+
+@app.get("/api/setup")
+async def setup_status():
+    """Check if first-run setup is complete."""
+    val = db.kv_get("setup_complete")
+    return {"complete": val is not None and val != ""}
+
+
+@app.post("/api/setup")
+async def setup_save(request: Request):
+    """Save first-run onboarding data."""
+    try:
+        req = await request.json()
+    except Exception as e:
+        logger.event("setup_error", error=str(e))
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+    if "tz_offset" in req:
+        offset = int(req["tz_offset"])
+        if not -12 <= offset <= 14:
+            return JSONResponse({"error": f"Invalid timezone offset: {offset}"}, status_code=400)
+        config.TZ_OFFSET = offset
+        db.kv_set("timezone", str(offset))
+    if req.get("tz_name"):
+        db.kv_set("timezone_name", req["tz_name"])
+
+    if req.get("user_name"):
+        db.kv_set("user_name", req["user_name"].strip())
+    if req.get("agent_name"):
+        db.kv_set("soul:name", req["agent_name"].strip())
+    if req.get("language"):
+        db.kv_set("soul:language", req["language"].strip())
+
+
+    if req.get("provider"):
+        prov = req["provider"]
+        if req.get("api_key"):
+            providers.set_key(prov, req["api_key"])
+        if req.get("endpoint"):
+            p = providers.get_provider(prov)
+            p["url"] = req["endpoint"]
+            db.kv_set(f"provider:config:{prov}", json.dumps(p))
+
+        result = providers.switch(prov)
+        logger.event("provider_switch", provider=prov, result=result)
+        if req.get("model"):
+            providers.set_model(req["model"])
+
+    traits = req.get("traits", {})
+    for key, val in traits.items():
+
+        if isinstance(val, str) and val in ("low", "moderate", "high"):
+            db.kv_set(f"soul:{key}", val)
+        elif isinstance(val, (int, float)):
+
+            n = max(0, min(10, int(val)))
+            level = "low" if n <= 3 else "moderate" if n <= 6 else "high"
+            db.kv_set(f"soul:{key}", level)
+
+    db.kv_set("setup_complete", "1")
+    logger.event("setup_complete", user=req.get("user_name"), provider=req.get("provider"))
+    return {"ok": True}
+
+
+@app.get("/api/network")
+async def network_status():
+    """Get network access status."""
+    lan_val = db.kv_get("network:lan_access")
+    lan = lan_val != "0"
+    return {"lan_access": lan, "ip": _get_lan_ip() or "unknown", "port": _current_port}
+
+
+@app.post("/api/network")
+async def network_toggle(request: Request):
+    """Toggle LAN access."""
+    req = await request.json()
+    lan = bool(req.get("lan_access", False))
+    db.kv_set("network:lan_access", "1" if lan else "0")
+    return {"lan_access": lan, "restart_required": True}
+
+
+@app.get("/api/history")
+async def history(limit: int = 20, thread_id: str | None = None):
+    """Recent conversation history for a thread."""
+    msgs = db.get_recent_messages(limit=limit, thread_id=thread_id)
+    result = []
+    for m in msgs:
+        if m["role"] not in ("user", "assistant") or not m.get("content"):
+            continue
+        entry = {"role": m["role"], "content": m["content"]}
+        if m.get("meta"):
+            entry["meta"] = m["meta"]
+        result.append(entry)
+    return result
+
+
+@app.get("/api/logs")
+async def logs(file: str = "castor.log", lines: int = 50):
+    """Tail log files."""
+
+    import re as _re_mod
+    if not _re_mod.match(r"^[\w\-]+\.log$", file):
+        return JSONResponse({"error": "invalid filename"}, status_code=400)
+    logs_dir = config.LOGS_DIR.resolve()
+    log_path = (logs_dir / file).resolve()
+
+    if not log_path.is_relative_to(logs_dir):
+        return JSONResponse({"error": "invalid path"}, status_code=400)
+    if not log_path.exists():
+        return {"lines": []}
+
+    all_lines = log_path.read_text(errors="replace").splitlines()
+    return {"lines": all_lines[-lines:]}
+
+
+@app.get("/api/secrets")
+async def list_secrets():
+    """List secret keys (no values!)."""
+    return vault.list_keys()
+
+
+@app.post("/api/secrets")
+async def put_secret(data: dict):
+    """Encrypt and store a secret. Body: ``{"key": "name", "value": "token"}``."""
+    key = (data.get("key") or "").strip()
+    value = data.get("value", "")
+    if not key:
+        return JSONResponse({"error": "key required"}, status_code=400)
+    if value is None or value == "":
+        return JSONResponse({"error": "value required"}, status_code=400)
+    return {"result": vault.save(key, value)}
+
+
+@app.delete("/api/secrets/{key}")
+async def delete_secret(key: str):
+    """Delete a secret."""
+    return {"result": vault.delete(key)}
+
+
+@app.get("/api/memory/list")
+async def memory_list(limit: int = 50, tag: str | None = None):
+    """List recent plain-memory entries (the things behind Save-to-memory).
+
+    Reads from the markdown layer (Phase 1 Living Memory) which is the
+    canonical source — fast filesystem walk, no Qdrant scroll. Falls
+    through to an empty list if memory_store hasn't been used yet.
+
+    Filters by tag if given. Default returns the 50 most recently
+    updated atoms across all tags.
+    """
+    try:
+        import memory_store
+        ids = memory_store.iter_all()
+    except Exception as e:
+        _log.warning(f"memory_store.iter_all failed: {e}")
+        return {"entries": []}
+
+    entries = []
+    for pid in ids:
+        try:
+            r = memory_store.read(pid)
+            if not r:
+                continue
+            if tag and r.get("tag") != tag:
+                continue
+            full = r.get("text") or ""
+            capped = full[:20000]
+            entries.append({
+                "id": r.get("id"),
+                "tag": r.get("tag"),
+                "thread_id": r.get("thread_id"),
+                "created": r.get("created"),
+                "updated": r.get("updated"),
+                "text": capped,
+                "truncated": len(full) > len(capped),
+                "len": len(full),
+            })
+        except Exception:
+            continue
+
+    entries.sort(key=lambda e: e.get("updated") or e.get("created") or "", reverse=True)
+    return {"entries": entries[:limit]}
+
+
+@app.delete("/api/memory/{point_id}")
+async def memory_delete_direct(point_id: str):
+    """Delete a single plain-memory entry by id.
+
+    Goes through ``memory.delete`` so both Qdrant and the markdown
+    twin are cleaned up consistently.
+    """
+    ok = mem.delete(point_id)
+    if not ok:
+        return JSONResponse({"error": "delete failed"}, status_code=500)
+    return {"ok": True}
+
+
+@app.post("/api/memory/save")
+async def memory_save_direct(data: dict):
+    """Save text to long-term memory directly, bypassing the agent.
+
+    UI's 'Save to memory' button on chat messages used to round-trip
+    through the LLM ("Save this to memory: <text>"), which was slow,
+    burned tokens, and often skipped the save (rule 8 in the system
+    prompt biases the agent toward NOT saving on its own initiative).
+    This is a direct path: write to memory and surface success/failure
+    without an agent round-trip.
+
+    Body: ``{text: "...", tag?: "user", thread_id?: "..."}``
+    """
+    text = (data.get("text") or "").strip()
+    if not text:
+        return JSONResponse({"error": "text required"}, status_code=400)
+    if len(text) > 8000:
+        text = text[:8000]
+    tag = (data.get("tag") or "user").strip() or "user"
+    thread_id = data.get("thread_id")
+
+
+    chunk = bool(data.get("chunk", False))
+
+
+    try:
+        point_id = mem.save(text, tag=tag, thread_id=thread_id,
+                             dedup=True, chunk=chunk, synth=True)
+    except Exception as e:
+        _log.warning(f"manual memory save failed: {e}", exc_info=True)
+        return JSONResponse({"error": _sanitize_err(e)}, status_code=500)
+    return {"ok": True, "id": point_id, "tag": tag}
+
+
+@app.post("/api/abort")
+async def abort_generation():
+    """Abort current agent generation.
+
+    Fires every active WS session's per-request abort event plus the legacy
+    shared one (so REST-only callers of _run_agent_sync still work). Does not
+    discriminate between sessions — matches the original behaviour.
+    """
+    with _ws_abort_lock:
+        for evt in list(_ws_abort_events):
+            evt.set()
+    _abort_event.set()
+    return {"ok": True}
+
+
+@app.get("/api/thinking")
+async def get_thinking():
+    val = db.kv_get("thinking_enabled")
+
+    enabled = val != "false" if val is not None else True
+    return {"enabled": enabled}
+
+
+@app.post("/api/thinking")
+async def set_thinking(data: dict):
+    val = bool(data.get("enabled", False))
+    db.kv_set("thinking_enabled", str(val).lower())
+    return {"enabled": val}
+
+
+@app.get("/api/vision/cameras")
+async def list_cameras():
+    """Scan available cameras with preview snapshots."""
+    loop = asyncio.get_event_loop()
+
+    def _scan_sync():
+        cameras = []
+        try:
+
+
+            import cv2
+            for i in range(5):
+                cap = cv2.VideoCapture(i)
+                if not cap.isOpened():
+                    continue
+
+                for _ in range(5):
+                    cap.read()
+                time.sleep(0.2)
+                ret, frame = cap.read()
+                cap.release()
+                if not ret:
+                    continue
+                h, w = frame.shape[:2]
+                brightness = float(frame.mean())
+
+                preview_b64 = None
+                try:
+                    scale = min(160 / w, 120 / h)
+                    thumb = cv2.resize(frame, (int(w * scale), int(h * scale)))
+                    _, buf = cv2.imencode('.jpg', thumb, [cv2.IMWRITE_JPEG_QUALITY, 60])
+                    preview_b64 = base64.b64encode(buf).decode()
+                except Exception:
+                    pass
+                cameras.append({
+                    "index": i,
+                    "resolution": f"{w}x{h}",
+                    "brightness": round(brightness, 1),
+                    "usable": brightness > 3,
+                    "preview": preview_b64,
+                })
+        except ImportError:
+            pass
+        return cameras
+
+    cameras = await loop.run_in_executor(None, _scan_sync)
+    current = config.get("camera_index")
+    return {"cameras": cameras, "selected": current}
+
+
+@app.post("/api/vision/reset")
+async def vision_reset():
+    """Reset persistent camera (e.g. after changing camera_index setting)."""
+    tools.camera_release()
+    return {"ok": True}
+
+
+@app.get("/api/streaming")
+async def get_streaming():
+    return {"enabled": db.kv_get("streaming_enabled") != "false"}
+
+
+async def request_camera_frame(timeout: float = 5.0) -> str | None:
+    """Request a camera frame from the connected WebSocket client.
+    Returns base64 JPEG or None if no client/camera available.
+    Called by agent tools (camera_capture) from background thread.
+    """
+    req_id = uuid.uuid4().hex[:8]
+    event = asyncio.Event()
+    _pending_frame_requests[req_id] = {"event": event, "image_b64": None}
+
+
+    await _broadcast({"type": "get_frame", "request_id": req_id})
+
+
+    try:
+        await asyncio.wait_for(event.wait(), timeout=timeout)
+    except asyncio.TimeoutError:
+        _pending_frame_requests.pop(req_id, None)
+        return None
+
+    result = _pending_frame_requests.pop(req_id, {}).get("image_b64")
+    return result
+
+
+def request_camera_frame_sync(timeout: float = 5.0) -> str | None:
+    """Synchronous wrapper for request_camera_frame — used by agent tools."""
+    if not _ws_loop or not _ws_clients:
+        return None
+    future = asyncio.run_coroutine_threadsafe(request_camera_frame(timeout), _ws_loop)
+    try:
+        return future.result(timeout=timeout + 1)
+    except Exception:
+        return None
+
+
+async def request_canvas_prompt(html: str, title: str = "",
+                                 timeout: float = 300.0) -> dict | None:
+    """Render a canvas form to the WS client and BLOCK until the user
+    submits, closes the panel, or the timeout elapses.
+
+    Returns:
+        - dict (form submission data) on user submit
+        - {} on user close without submit
+        - None on no client connected or timeout
+
+    Used by the `canvas_prompt` tool — mirrors `request_camera_frame`.
+    Pending requests live in `_pending_canvas_prompts`; the WS handler
+    for `canvas_event` resolves them when the iframe's postMessage
+    routes a submit/close back.
+    """
+    req_id = uuid.uuid4().hex[:8]
+    event = asyncio.Event()
+    _pending_canvas_prompts[req_id] = {"event": event, "data": None, "closed": False}
+
+    await _broadcast({
+        "type": "canvas_render",
+        "request_id": req_id,
+        "title": title or "Form",
+        "html": html,
+    })
+
+    try:
+        await asyncio.wait_for(event.wait(), timeout=timeout)
+    except asyncio.TimeoutError:
+        _pending_canvas_prompts.pop(req_id, None)
+
+
+        try:
+            await _broadcast({"type": "canvas_close", "request_id": req_id})
+        except Exception:
+            pass
+        return None
+
+    entry = _pending_canvas_prompts.pop(req_id, {})
+    if entry.get("closed"):
+
+
+        return {}
+
+
+    _track_canvas_render_for_history(title=title or "Form", html=html, slug=None)
+    return entry.get("data")
+
+
+def request_canvas_prompt_sync(html: str, title: str = "",
+                                timeout: float = 300.0) -> dict | None:
+    """Synchronous wrapper — called from the agent's executor thread."""
+    if not _ws_loop or not _ws_clients:
+        return None
+    future = asyncio.run_coroutine_threadsafe(
+        request_canvas_prompt(html, title, timeout), _ws_loop)
+    try:
+        return future.result(timeout=timeout + 1)
+    except Exception:
+        return None
+
+
+def broadcast_canvas_render_sync(html: str, title: str = "",
+                                   slug: str | None = None) -> bool:
+    """Fire-and-forget: emit a canvas_render WS event without waiting
+    for user interaction. Used by the `canvas_render` and `canvas_load`
+    tools. Returns True if the broadcast was scheduled, False if no
+    WS client is connected.
+    """
+    if not _ws_loop or not _ws_clients:
+        return False
+    payload = {"type": "canvas_render", "title": title or "", "html": html}
+    if slug:
+        payload["slug"] = slug
+    try:
+        asyncio.run_coroutine_threadsafe(_broadcast(payload), _ws_loop)
+        _track_canvas_render_for_history(title=title or "Canvas", html=html, slug=slug)
+        return True
+    except Exception:
+        return False
+
+
+def _resolve_canvas_thread_id() -> str:
+    """Best-effort thread-id resolution for a canvas-render event.
+
+    The skill calls _track_canvas_render_for_history from the agent's
+    executor thread. The current turn's thread is most reliably
+    available via threads.get_active_id() (per-process), which is the
+    same source `db._tid(None)` falls back to.
+
+    Multi-client races (web + telegram concurrent turns) can still
+    misattribute, but that's the documented TurnContext-violation
+    limit and not in scope here — the user-reported bug is the
+    single-client cross-thread leak, which thread-bucketing solves.
+    """
+    try:
+        import threads
+        return threads.get_active_id() or "default"
+    except Exception:
+        return "default"
+
+
+def _track_canvas_render_for_history(title: str, html: str, slug: str | None,
+                                       thread_id: str | None = None) -> None:
+    """Append a canvas render to the per-thread pending list so the WS
+    reply assembly can persist it onto the assistant message's
+    meta.canvas. This is what makes the threadCanvases chip strip
+    survive page reloads + thread switches.
+
+    `thread_id` defaults to the currently-active thread. Each thread
+    has its own bucket — WS reply for thread A only drains A's bucket,
+    so a leftover from thread B can't be misattributed.
+
+    HTML is capped at `_CANVAS_META_HTML_CAP` per entry to keep
+    message-meta rows bounded. Over the cap, entries store the
+    metadata + a `truncated: True` marker (so the chip still shows
+    up — the user just won't be able to re-render the exact content
+    without asking the agent again or loading from canvas_artifacts
+    if a slug was supplied).
+    """
+    try:
+        if not isinstance(html, str):
+            return
+        tid = thread_id or _resolve_canvas_thread_id()
+        size = len(html.encode("utf-8", errors="replace"))
+        if size > _CANVAS_META_HTML_CAP:
+            entry = {
+                "title": title or "Canvas",
+                "slug": slug or None,
+                "html": "",
+                "html_size": size,
+                "ts": time.time(),
+                "truncated": True,
+            }
+        else:
+            entry = {
+                "title": title or "Canvas",
+                "slug": slug or None,
+                "html": html,
+                "html_size": size,
+                "ts": time.time(),
+            }
+        _pending_canvas_renders.setdefault(tid, []).append(entry)
+    except Exception as e:
+        _log.debug(f"canvas render tracking failed (non-fatal): {e}")
+
+
+def broadcast_canvas_close_sync() -> bool:
+    """Fire-and-forget close — used by a potential future `canvas_close`
+    tool. Returns True if scheduled."""
+    if not _ws_loop or not _ws_clients:
+        return False
+    try:
+        asyncio.run_coroutine_threadsafe(
+            _broadcast({"type": "canvas_close"}), _ws_loop)
+        return True
+    except Exception:
+        return False
+
+
+@app.post("/api/streaming")
+async def set_streaming(data: dict):
+    val = bool(data.get("enabled", True))
+    db.kv_set("streaming_enabled", str(val).lower())
+    return {"enabled": val}
+
+
+@app.get("/api/soul")
+async def get_soul():
+    """Get soul config with trait descriptions."""
+    s = soul.load()
+    descs = soul.get_trait_descriptions()
+    return {"values": s, "traits": descs}
+
+
+@app.post("/api/soul")
+async def set_soul(data: dict):
+    """Update soul traits."""
+    results = {}
+    for key, value in data.items():
+        results[key] = soul.save(key, value)
+    return results
+
+
+@app.post("/api/soul/traits")
+async def add_soul_trait(data: dict):
+    """Add a custom trait."""
+    name = data.get("name", "")
+    low = data.get("low", "low")
+    high = data.get("high", "high")
+    value = data.get("value", "moderate")
+    return {"result": soul.add_trait(name, low, high, value)}
+
+
+@app.delete("/api/soul/traits/{name}")
+async def remove_soul_trait(name: str):
+    """Remove a custom trait."""
+    return {"result": soul.remove_trait(name)}
+
+
+@app.get("/api/settings")
+async def get_settings():
+    """Get all editable settings."""
+    return config.get_all()
+
+
+@app.post("/api/settings")
+async def update_settings(request: Request):
+    """Update one or more settings. Body: {"key": value, ...}"""
+    data = await request.json()
+    results = {}
+    for key, value in data.items():
+        results[key] = config.set(key, value)
+    return {"results": results}
+
+
+@app.get("/api/telemetry/status")
+async def telemetry_status():
+    """Current opt-in state, anonymous id (truncated for display),
+    endpoint URL, queue count, and a copy of ALLOWED_EVENTS for the UI
+    transparency panel. Anonymous id only exposed truncated to first 8
+    chars — full id is never read by UI, only used for transmission.
+    """
+    import telemetry
+    aid = config.get("telemetry_anonymous_id") or ""
+    return {
+        "enabled": telemetry.enabled(),
+        "anonymous_id_short": aid[:8] + "..." if aid else "",
+        "anonymous_id_set": bool(aid),
+        "endpoint": config.get("telemetry_endpoint") or "",
+        "queue_size": telemetry.queue_size(),
+        "session_id": telemetry.session_id(),
+        "allowed_events": list(telemetry.ALLOWED_EVENTS.keys()),
+
+
+        "consent_needs_reprompt": telemetry.consent_needs_reprompt(),
+        "current_consent_version": telemetry._CURRENT_CONSENT_VERSION,
+
+
+        "consent_decision_made": telemetry.consent_decision_made(),
+    }
+
+
+@app.post("/api/telemetry/opt-in")
+async def telemetry_opt_in():
+    """Enable telemetry + ensure anonymous id exists. Idempotent."""
+    import telemetry
+    aid = telemetry.opt_in()
+    return {"ok": True, "anonymous_id_short": aid[:8] + "..."}
+
+
+@app.post("/api/telemetry/opt-out")
+async def telemetry_opt_out():
+    """Disable telemetry, drop queue, KEEP anonymous id."""
+    import telemetry
+    telemetry.opt_out()
+    return {"ok": True}
+
+
+@app.post("/api/telemetry/forget-me")
+async def telemetry_forget_me():
+    """Disable + drop queue + WIPE anonymous id. Stronger than opt-out."""
+    import telemetry
+    telemetry.forget_me()
+    return {"ok": True}
+
+
+@app.post("/api/telemetry/reset-id")
+async def telemetry_reset_id():
+    """Rotate anonymous id without changing the enabled flag."""
+    import telemetry
+    aid = telemetry.reset_anonymous_id()
+    return {"ok": True, "anonymous_id_short": aid[:8] + "..."}
+
+
+@app.get("/api/telemetry/preview")
+async def telemetry_preview():
+    """Snapshot of the queued events. Lets the user see exactly what
+    would be sent before pressing flush. Anonymous_id and session_id
+    are returned in full here because the user is looking at THEIR own
+    queue on THEIR own machine — no third party involved."""
+    import telemetry
+    return {"events": telemetry.get_pending_events()}
+
+
+@app.post("/api/telemetry/flush")
+async def telemetry_flush():
+    """Manually flush the queue. Returns count sent. No-op when
+    endpoint is empty (returns 0)."""
+    import telemetry
+    sent = telemetry.flush()
+    return {"sent": sent, "remaining": telemetry.queue_size()}
+
+
+@app.post("/api/telemetry/clear-queue")
+async def telemetry_clear_queue():
+    """Drop all queued events without sending. For users who opted in,
+    queued some events, then changed their mind before any flush."""
+    import telemetry
+    n = telemetry.clear_queue()
+    return {"ok": True, "dropped": n}
+
+
+@app.get("/api/kv/{key}")
+async def kv_get(key: str):
+    """Get a raw key-value pair from DB."""
+    value = db.kv_get(key)
+    return {"key": key, "value": value}
+
+
+_KV_WRITE_BLOCKLIST: tuple[str, ...] = (
+    "telegram:owner_id",
+    "version:",
+    "setup_",
+    "_migrated_",
+    "provider:config:",
+    "setting:",
+    "soul:",
+)
+
+
+@app.post("/api/kv")
+async def kv_set(request: Request):
+    """Set a raw key-value pair in DB."""
+    data = await request.json()
+    key = data.get("key", "")
+    value = data.get("value", "")
+    if not isinstance(key, str) or not key:
+        return JSONResponse({"error": "key required"}, status_code=400)
+    if len(key) > 200:
+        return JSONResponse({"error": "key too long (max 200 chars)"}, status_code=400)
+    for prefix in _KV_WRITE_BLOCKLIST:
+        if key.startswith(prefix):
+            return JSONResponse(
+                {"error": f"key '{key}' is protected (prefix '{prefix}' reserved for internal state)"},
+                status_code=403,
+            )
+    db.kv_set(key, value)
+    return {"ok": True, "key": key}
+
+
+@app.get("/api/config/export")
+async def export_config_endpoint():
+    """Export all settings as downloadable JSON."""
+    data = config.export_config()
+    filename = f"castor-config-{time.strftime('%Y%m%d')}.json"
+    return Response(
+        content=json.dumps(data, indent=2, ensure_ascii=False),
+        media_type="application/json",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
+@app.post("/api/config/import")
+async def import_config_endpoint(request: Request):
+    """Import settings from JSON. Accepts multipart file or JSON body."""
+    content_type = request.headers.get("content-type", "")
+    if "multipart" in content_type:
+        form = await request.form()
+        file = form.get("file")
+        if not file:
+            return JSONResponse({"error": "no file"}, status_code=400)
+        raw = await file.read()
+        data = json.loads(raw)
+    else:
+        data = await request.json()
+    results = config.import_config(data)
+    return {"results": results, "count": len(results)}
+
+
+@app.get("/api/providers")
+async def get_providers():
+    """List all providers with status."""
+    return providers.list_all()
+
+
+@app.get("/api/models")
+async def get_models(provider: str | None = None):
+    """Fetch available models from a provider."""
+    return {"models": providers.fetch_models(provider), "provider": provider or providers.get_active_name()}
+
+
+@app.post("/api/model")
+async def set_model(data: dict):
+    """Switch model and/or provider."""
+    results = []
+    if "provider" in data:
+        results.append(providers.switch(data["provider"]))
+    if "model" in data:
+        results.append(providers.set_model(data["model"]))
+    return {"results": results, "model": providers.get_model(), "provider": providers.get_active_name()}
+
+
+@app.post("/api/provider")
+async def add_provider(data: dict):
+    """Add or update a provider."""
+    name = data.get("name", "")
+    if not name:
+        return JSONResponse({"error": "name required"}, status_code=400)
+    if "key" in data and "url" not in data:
+
+        return {"result": providers.set_key(name, data["key"])}
+    url = data.get("url", "")
+    key = data.get("key", "")
+    models = data.get("models", [])
+    return {"result": providers.add(name, url, key, models)}
+
+
+@app.get("/api/analytics/period")
+async def get_analytics_period(days: int = 30, source: str | None = None):
+    """Aggregated token/cost metrics for a rolling time window."""
+    import time as _time
+    end_ts = _time.time()
+    start_ts = end_ts - max(1, int(days)) * 86400
+    src = None if not source or source == "all" else source
+    return db.get_period_totals(start_ts, end_ts, source=src)
+
+
+@app.get("/api/pricing/status")
+async def pricing_status():
+    """Return pricing cache metadata: model count, source URL, cache age."""
+    import pricing
+    import config
+    import time as _time
+    fetched = pricing.last_updated()
+    return {
+        "last_updated": fetched,
+        "model_count": len(pricing.all_known_models()),
+        "source_url": config.get("pricing_url"),
+        "auto_update": config.get("pricing_auto_update"),
+        "cache_age_sec": (_time.time() - fetched) if fetched else None,
+    }
+
+
+@app.post("/api/pricing/refresh")
+async def pricing_refresh():
+    """Force-refresh the pricing table from the configured source URL."""
+    import pricing
+    ok = pricing.refresh_pricing(force=True)
+    if not ok:
+        return JSONResponse({"ok": False, "error": "refresh failed"}, status_code=502)
+    return {"ok": True, "model_count": len(pricing.all_known_models()),
+            "fetched_at": pricing.last_updated()}
+
+
+@app.get("/api/cron")
+async def list_cron():
+    """List scheduled tasks."""
+    return scheduler.list_tasks()
+
+
+@app.post("/api/cron")
+async def add_cron(data: dict):
+    """Create a routine and kick off its first run in the background.
+
+    agent.run writes the user message + assistant reply via its normal
+    ``db.save_message`` path. Concurrent fires (auto-run + manual Run +
+    cron tick) are serialised by ``_execute_routine``'s per-thread lock
+    — second caller no-ops cleanly instead of racing.
+
+    ``skip_dry_run`` legacy kwarg: the Web UI always sends True. The old
+    dry-run validation path is kept for API callers but shouldn't be used
+    — the whole dry-run concept was a source of confusion.
+    """
+    name = data.get("name", "")
+    task = data.get("task", "")
+    result = scheduler.add(
+        name,
+        task,
+        data.get("schedule", ""),
+        skip_dry_run=bool(data.get("skip_dry_run", False)),
+    )
+
+
+    if result.get("ok"):
+        try:
+            import telemetry as _tel
+            _tel.track_feature_first_use("scheduler_create")
+        except Exception:
+            pass
+    if result.get("ok") and result.get("thread_id") and task:
+        import threading as _th
+        thread_id = result["thread_id"]
+
+        row = scheduler.db.fetchone(
+            "SELECT id FROM scheduled_tasks WHERE name=? AND thread_id=? "
+            "ORDER BY id DESC LIMIT 1",
+            (name, thread_id),
+        )
+        cron_id = row[0] if row else 0
+
+        def _fire_first_run():
+            try:
+                scheduler._execute_routine(task, name, cron_id, thread_id)
+            except Exception as e:
+                scheduler._log.warning(
+                    f"routine auto-run failed #{cron_id}: {e}", exc_info=True
+                )
+        _th.Thread(target=_fire_first_run, daemon=True).start()
+    return result
+
+
+@app.delete("/api/cron/{task_id}")
+async def remove_cron(task_id: int):
+    """Remove a scheduled task."""
+    return {"result": scheduler.remove(task_id)}
+
+
+@app.get("/api/cron/{task_id}/runs")
+async def get_cron_runs(task_id: int, limit: int = 20):
+    """Recent run history for a routine, newest first.
+
+    Each row is one fire attempt — ok / err / missed / skipped. The
+    "missed" rows are logged by scheduler.detect_missed_runs() when the
+    server comes back up and finds scheduled slots that lapsed while
+    offline. UI uses this to render a sparkline + detail list.
+    """
+    return {"runs": scheduler.list_runs(task_id, limit=limit)}
+
+
+@app.get("/api/routines/{cron_id}/runs")
+async def get_routine_runs(cron_id: int, limit: int = 50):
+    """Recent run history for a routine (reads agent_runs), newest first."""
+    return db.get_runs_for_routine(cron_id, limit=limit)
+
+
+@app.get("/api/routines/{cron_id}/budget")
+async def get_routine_budget_endpoint(cron_id: int):
+    """Return current budget config + spend for a routine."""
+    b = db.get_routine_budget(cron_id)
+    if not b:
+        return {"cap": None, "period_sec": 86400, "spent": 0.0}
+    spent = db.get_routine_period_spend(cron_id, b["period_sec"])
+    return {"cap": b["cap"], "period_sec": b["period_sec"], "spent": spent}
+
+
+@app.post("/api/routines/{cron_id}/budget")
+async def set_routine_budget_endpoint(cron_id: int, body: dict):
+    """Set or clear a routine's budget cap.
+
+    body: {"cap": float|null, "period_sec": int}
+    cap=null clears the cap (no enforcement).
+    """
+    cap = body.get("cap")
+    period_sec = int(body.get("period_sec") or 86400)
+    if cap is not None:
+        cap = float(cap)
+        if cap < 0:
+            return JSONResponse({"ok": False, "error": "cap must be >= 0"}, status_code=400)
+    conn = db._get_conn()
+    conn.execute(
+        "UPDATE scheduled_tasks SET budget_usd_cap = ?, budget_period_sec = ? WHERE id = ?",
+        (cap, period_sec, int(cron_id)),
+    )
+    conn.commit()
+    return {"ok": True}
+
+
+@app.post("/api/cron/{task_id}/toggle")
+async def toggle_cron(task_id: int, data: dict | None = None):
+    """Pause or resume a routine.
+
+    Body ``{enabled: true|false}`` explicit; empty body toggles.
+    """
+    enabled = None
+    if data and "enabled" in data:
+        enabled = bool(data["enabled"])
+    result = scheduler.set_enabled(task_id, enabled)
+    if "error" in result:
+        return JSONResponse(result, status_code=404)
+    return result
+
+
+@app.post("/api/goals")
+async def create_goal(data: dict):
+    """Enqueue a new goal for the worker.
+
+    Body: {
+      user_input: str,
+      thread_id?: str,
+      source?: "api"|"web",
+      meta?: dict,
+      budget_usd?: number,
+      budget_seconds?: number,
+      done_conditions?: list  // goal-level acceptance criteria (validator dicts).
+                              // Run by goal_runner AFTER subtask-gate passes,
+                              // BEFORE mark_goal_done. Each must match the
+                              // goal_validators contract (5 kinds: files_exist,
+                              // min_count, regex_in_file, shell_returns_zero,
+                              // http_200). Bad shape → 400 with details.
+    }
+    Returns: {id, status: "pending"}
+    """
+    user_input = (data.get("user_input") or "").strip()
+    if not user_input:
+        return JSONResponse({"error": "user_input required"}, status_code=400)
+    done_conditions = data.get("done_conditions")
+    if done_conditions is not None and not isinstance(done_conditions, list):
+        return JSONResponse(
+            {"error": "done_conditions must be a list of {kind, spec} objects"},
+            status_code=400,
+        )
+    try:
+        goal_id = db.create_goal(
+            user_input=user_input,
+            source=data.get("source") or "api",
+            thread_id=data.get("thread_id"),
+            budget_usd=data.get("budget_usd"),
+            budget_seconds=data.get("budget_seconds"),
+            meta=data.get("meta"),
+            done_conditions=done_conditions,
+        )
+    except ValueError as e:
+
+
+        return JSONResponse({"error": str(e)}, status_code=400)
+    return {"id": goal_id, "status": "pending"}
+
+
+@app.post("/api/goals/{goal_id}/done-conditions")
+async def set_goal_done_conditions(goal_id: str, data: dict):
+    """Replace the goal-level done_conditions. Useful for adding criteria
+    to a running goal — the gate-loop will pick them up on its next pass
+    (it re-reads the goal row at the top of each retry).
+
+    Body: {done_conditions: list}  — same shape as POST /api/goals.
+    """
+    g = db.get_goal(goal_id)
+    if not g:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    criteria = data.get("done_conditions")
+    if criteria is None or not isinstance(criteria, list):
+        return JSONResponse(
+            {"error": "done_conditions (list) required"},
+            status_code=400,
+        )
+    try:
+        db.set_goal_done_conditions(goal_id, criteria)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    return {"ok": True, "count": len(criteria)}
+
+
+@app.get("/api/goals")
+async def list_goals(status: str | None = None, thread_id: str | None = None, limit: int = 50):
+    """List goals, newest first. Optional filters: status, thread_id."""
+    return {"goals": db.list_goals(status=status, thread_id=thread_id, limit=limit)}
+
+
+@app.get("/api/goals/{goal_id}")
+async def get_goal(goal_id: str):
+    """Full goal row including plan, result, error, lease info."""
+    g = db.get_goal(goal_id)
+    if not g:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return g
+
+
+@app.get("/api/goals/{goal_id}/events")
+async def get_goal_events(goal_id: str, limit: int = 200):
+    """Event log for the goal — useful for live tailing in UI."""
+    if not db.get_goal(goal_id):
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return {"events": db.get_goal_events(goal_id, limit=limit)}
+
+
+@app.get("/api/goals/{goal_id}/facts")
+async def get_goal_facts(goal_id: str):
+    """All key/value facts saved by the orchestrator + subagents.
+
+    Facts survive context compaction and are durable across worker restarts.
+    Returns ``{facts: {key: value, ...}}``.
+    """
+    if not db.get_goal(goal_id):
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return {"facts": db.fact_get(goal_id)}
+
+
+@app.get("/api/goals/{goal_id}/outputs")
+async def get_goal_outputs(goal_id: str):
+    """Deliverables (files / links / reports) registered by the orchestrator
+    via goal_attach_output. Returns ``{outputs: [...]}``.
+    """
+    if not db.get_goal(goal_id):
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return {"outputs": db.get_goal_outputs(goal_id)}
+
+
+@app.get("/api/goals/{goal_id}/outputs/{output_id}/download")
+async def download_goal_output(goal_id: str, output_id: int):
+    """Stream a goal_output of kind='file' to the user's browser.
+
+    Re-validates the path against WORKSPACE_DIR on every request (the
+    LLM's goal_attach_output impl already did this at attach time, but
+    files can be moved/replaced between attach and download — never trust
+    the stored path implicitly).
+    """
+    from fastapi.responses import FileResponse
+
+    if not db.get_goal(goal_id):
+        return JSONResponse({"error": "not found"}, status_code=404)
+    out = db.get_goal_output(goal_id, output_id)
+    if not out:
+        return JSONResponse({"error": "output not found"}, status_code=404)
+    if out["kind"] != "file":
+        return JSONResponse(
+            {"error": f"output {output_id} is kind={out['kind']!r}, not a file"},
+            status_code=400,
+        )
+    try:
+        p = Path(out["value"]).expanduser().resolve()
+    except (OSError, RuntimeError):
+        return JSONResponse({"error": "invalid path"}, status_code=500)
+    workspace = Path(config.WORKSPACE_DIR).expanduser().resolve()
+    try:
+        p.relative_to(workspace)
+    except ValueError:
+        return JSONResponse(
+            {"error": "path escapes workspace (file was moved or symlinked)"},
+            status_code=403,
+        )
+    if not p.exists() or not p.is_file():
+        return JSONResponse({"error": "file no longer exists"}, status_code=404)
+    return FileResponse(str(p), filename=p.name)
+
+
+@app.post("/api/goals/{goal_id}/outputs/{output_id}/save-to-memory")
+async def save_output_to_memory(goal_id: str, output_id: int, data: dict | None = None):
+    """Persist a report output to long-term memory (Qdrant). UI's
+    "Save to memory" button calls this. Optional body: ``{tag: "..."}``;
+    defaults to 'goal_report'.
+    """
+    if not db.get_goal(goal_id):
+        return JSONResponse({"error": "not found"}, status_code=404)
+    out = db.get_goal_output(goal_id, output_id)
+    if not out:
+        return JSONResponse({"error": "output not found"}, status_code=404)
+    if out["kind"] != "report":
+        return JSONResponse(
+            {"error": f"only report kind can be saved to memory; got {out['kind']!r}"},
+            status_code=400,
+        )
+    tag = (data or {}).get("tag") or "goal_report"
+    try:
+        import memory
+
+
+        body = f"# {out['title']}\n\n{out['value']}"
+        memory.save(body, tag=tag)
+    except Exception as e:
+        return JSONResponse({"error": f"memory save failed: {e}"}, status_code=500)
+    return {"saved": True, "tag": tag}
+
+
+@app.delete("/api/goals/{goal_id}/outputs/{output_id}")
+async def delete_goal_output_endpoint(goal_id: str, output_id: int):
+    """Remove a single output. The file on disk (if any) is NOT deleted —
+    the user can still find it via Finder. Only the registration is gone."""
+    if not db.get_goal(goal_id):
+        return JSONResponse({"error": "not found"}, status_code=404)
+    if not db.delete_goal_output(goal_id, output_id):
+        return JSONResponse({"error": "output not found"}, status_code=404)
+    return {"deleted": True}
+
+
+@app.post("/api/goals/{goal_id}/pause")
+async def pause_goal(goal_id: str):
+    """Mark a goal paused. Worker observes on next heartbeat and releases lease.
+
+    Paused goals can be re-claimed by any worker via claim_next_goal.
+    """
+    g = db.get_goal(goal_id)
+    if not g:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    if g["status"] in db.GOAL_TERMINAL_STATUSES:
+        return JSONResponse({"error": f"goal already {g['status']}"}, status_code=409)
+    db.mark_goal_paused(goal_id, reason="user_paused")
+    return {"id": goal_id, "status": "paused"}
+
+
+@app.post("/api/goals/{goal_id}/resume")
+async def resume_goal(goal_id: str):
+    """Resume a paused goal. Worker's next poll will pick it up.
+
+    Internally this just flips status=paused → pending without clearing
+    the existing checkpoint, so the orchestrator picks up from the same
+    round it paused at.
+    """
+    g = db.get_goal(goal_id)
+    if not g:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    if g["status"] != "paused":
+        return JSONResponse(
+            {"error": f"can only resume paused goals (this one is {g['status']})"},
+            status_code=409,
+        )
+    conn = db._get_conn()
+    conn.execute(
+        "UPDATE goals SET status='pending', worker_id=NULL, lease_expires_at=NULL WHERE id=?",
+        (goal_id,),
+    )
+    conn.commit()
+    db.log_goal_event(goal_id, "resumed", {"reason": "user_resumed"})
+    return {"id": goal_id, "status": "pending"}
+
+
+@app.post("/api/goals/{goal_id}/abort")
+async def abort_goal(goal_id: str):
+    """Terminal abort. Won't be picked up again."""
+    g = db.get_goal(goal_id)
+    if not g:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    if g["status"] in db.GOAL_TERMINAL_STATUSES:
+        return JSONResponse({"error": f"goal already {g['status']}"}, status_code=409)
+    db.mark_goal_aborted(goal_id, reason="user_aborted")
+    return {"id": goal_id, "status": "aborted"}
+
+
+@app.delete("/api/goals/{goal_id}")
+async def delete_goal(goal_id: str):
+    """Permanently delete a goal + its checkpoints/events/facts (via FK cascade).
+
+    Refuses to delete a goal that's still ``running`` — caller should
+    POST /abort or /pause first to avoid removing a row a worker is
+    actively writing to.
+    """
+    g = db.get_goal(goal_id)
+    if not g:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    if g["status"] == "running":
+        return JSONResponse(
+            {"error": "abort or pause the goal before deleting it"},
+            status_code=409,
+        )
+    conn = db._get_conn()
+
+
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("DELETE FROM goals WHERE id=?", (goal_id,))
+    conn.commit()
+    return {"id": goal_id, "deleted": True}
+
+
+@app.post("/api/goals/cleanup")
+async def cleanup_goals(data: dict | None = None):
+    """Bulk-delete goals matching a filter. Currently supports
+    ``{status: "done"|"failed"|"aborted"}`` (or a list of statuses) so the
+    UI can offer a "clean up finished goals" button without listing every
+    goal_id individually.
+
+    Refuses to touch running / paused / pending goals — those need an
+    explicit abort first.
+    """
+    data = data or {}
+    status = data.get("status") or ["done", "failed", "aborted"]
+    if isinstance(status, str):
+        status = [status]
+
+
+    allowed = [s for s in status if s in db.GOAL_TERMINAL_STATUSES]
+    if not allowed:
+        return JSONResponse(
+            {"error": f"status must be one of {db.GOAL_TERMINAL_STATUSES}"},
+            status_code=400,
+        )
+    conn = db._get_conn()
+    conn.execute("PRAGMA foreign_keys = ON")
+    placeholders = ",".join("?" * len(allowed))
+    cur = conn.execute(
+        f"DELETE FROM goals WHERE status IN ({placeholders})",
+        allowed,
+    )
+    conn.commit()
+    return {"deleted": cur.rowcount, "statuses": allowed}
+
+
+@app.post("/api/cron/{task_id}/run")
+async def run_cron_now(task_id: int):
+    """Fire a routine immediately (manual trigger, out-of-schedule).
+
+    Returns thread_id so the UI can auto-navigate into the routine's chat
+    and watch the run stream in. Runs in a background thread so the HTTP
+    request returns fast — agent.run itself persists the reply to the DB.
+
+    If a fire is already in progress for this routine's thread (e.g. user
+    clicked Run twice, or auto-run from create is still running), return
+    ``already_running: true`` so the UI can show a meaningful message
+    instead of pretending to queue.
+    """
+    import threading as _th
+    row = scheduler.db.fetchone(
+        "SELECT name, task, schedule, thread_id FROM scheduled_tasks WHERE id=?",
+        (task_id,),
+    )
+    if not row:
+        return JSONResponse({"error": f"routine {task_id} not found"}, status_code=404)
+    name, task, schedule, thread_id = row
+    if not thread_id:
+        thread_id = scheduler._ensure_routine_thread(task_id, name, schedule)
+    if scheduler.is_routine_firing(thread_id):
+        return {"ok": False, "already_running": True,
+                "thread_id": thread_id, "name": name,
+                "hint": "This routine is already running — wait for the current turn to finish."}
+
+
+    def _fire():
+        try:
+            scheduler._execute_routine(task, name, task_id, thread_id)
+        except Exception as e:
+            scheduler._log.warning(f"manual run failed #{task_id}: {e}", exc_info=True)
+    _th.Thread(target=_fire, daemon=True).start()
+    return {"ok": True, "thread_id": thread_id, "name": name}
+
+
+@app.get("/api/tasks")
+async def list_tasks():
+    """Get background task results."""
+    return {"pending": tasks.pending_count(), "results": tasks.get_results(clear=False)}
+
+
+def _emit_knowledge(data: dict):
+    """Broadcast knowledge indexing event to WS clients."""
+    if _ws_loop and _ws_clients:
+        try:
+            asyncio.run_coroutine_threadsafe(_broadcast(data), _ws_loop)
+        except Exception:
+            pass
+
+
+def _run_knowledge_index(task_id: int, files: list[dict], tags: list[str] | None = None):
+    """Background knowledge indexing thread."""
+    global _knowledge_task
+
+    errors = []
+    results = []
+
+    def progress_cb(current, total, filepath, phase, detail=""):
+        with _knowledge_lock:
+            if _knowledge_task:
+                _knowledge_task.update({"current": current, "total": total, "file": Path(filepath).name, "phase": phase})
+        _emit_knowledge({
+            "type": "knowledge_progress",
+            "current": current, "total": total,
+            "file": Path(filepath).name,
+            "phase": phase, "detail": detail
+        })
+
+    def phase_cb(phase_type, count, estimate_sec):
+        _emit_knowledge({
+            "type": "knowledge_gpu_warning",
+            "files_count": count,
+            "estimate_sec": estimate_sec
+        })
+
+    try:
+        results = rag.index_files_batch(files, progress_cb=progress_cb, phase_cb=phase_cb, tags=tags or None)
+        errors = [r for r in results if r.get("status") not in ("indexed", "already up to date")]
+    except Exception as e:
+        _log.error(f"knowledge indexing failed: {e}", exc_info=True)
+        errors.append({"error": _sanitize_err(e)})
+
+
+    total_chunks = sum(r.get("chunks", 0) for r in results)
+
+    with _knowledge_lock:
+        if _knowledge_task:
+            _knowledge_task.update({
+                "status": "done",
+                "files_done": len(results),
+                "chunks_done": total_chunks,
+                "errors_count": len(errors),
+            })
+
+    _emit_knowledge({
+        "type": "knowledge_done",
+        "files": len(results),
+        "chunks": total_chunks,
+        "errors": len(errors),
+        "duration_sec": 0
+    })
+
+
+    tasks.update(task_id, "done", f"Indexed {len(results)} files, {total_chunks} chunks")
+
+
+    started = 0
+    with _knowledge_lock:
+        started = (_knowledge_task or {}).get("started_at", time.time()) if _knowledge_task else time.time()
+    _push_history({
+        "kind": "batch" if len(files) > 1 else "file",
+        "label": (files[0].get("path") or files[0].get("url", ""))[:120] if files else "(batch)",
+        "status": "done" if not errors else "partial" if results else "error",
+        "chunks": total_chunks,
+        "files": len(results),
+        "errors_count": len(errors),
+        "duration_sec": round(time.time() - started, 2),
+        "converter": "markitdown",
+    })
+
+
+    def _clear_task():
+        time.sleep(10)
+        with _knowledge_lock:
+            global _knowledge_task
+            _knowledge_task = None
+    threading.Thread(target=_clear_task, daemon=True).start()
+
+
+@app.get("/api/files/browse")
+async def file_browse(request: Request):
+    """Browse directory contents for Knowledge file picker."""
+    params = request.query_params
+    home = str(Path.home())
+    raw_path = params.get("path", home)
+    show_hidden = params.get("hidden", "false").lower() == "true"
+
+    try:
+        p = _validate_home_path(raw_path)
+    except ValueError as e:
+        return JSONResponse({"error": _sanitize_err(e)}, status_code=403)
+    except FileNotFoundError as e:
+        return JSONResponse({"error": _sanitize_err(e)}, status_code=404)
+
+    if not p.is_dir():
+
+        p = p.parent
+
+
+    depth = len(p.relative_to(Path.home().resolve()).parts)
+    if depth > 10:
+        return JSONResponse({"error": "Maximum directory depth exceeded"}, status_code=400)
+
+
+    indexable_exts = getattr(rag, 'ALL_INDEXABLE', rag.SUPPORTED_EXTENSIONS | {'.pdf'})
+
+
+    items = []
+    try:
+        for entry in sorted(p.iterdir(), key=lambda e: (not e.is_dir(), e.name.lower())):
+            name = entry.name
+
+
+            if name.startswith('.') and not show_hidden:
+                continue
+
+
+            if entry.is_symlink():
+                try:
+                    target = entry.resolve()
+                    if not str(target).startswith(home):
+                        continue
+                except (OSError, ValueError):
+                    continue
+
+            try:
+                stat = entry.stat()
+            except (PermissionError, OSError):
+                continue
+
+            if entry.is_dir():
+                items.append({
+                    "name": name,
+                    "type": "dir",
+                    "size": None,
+                    "modified": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(stat.st_mtime)),
+                })
+            elif entry.is_file():
+                ext = entry.suffix.lower()
+                items.append({
+                    "name": name,
+                    "type": "file",
+                    "size": stat.st_size,
+                    "ext": ext,
+                    "indexable": ext in indexable_exts,
+                    "modified": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(stat.st_mtime)),
+                })
+    except PermissionError:
+        return JSONResponse({"error": "Permission denied"}, status_code=403)
+
+
+    parent = str(p.parent) if str(p) != home else None
+
+    return {
+        "current": str(p),
+        "parent": parent,
+        "home": home,
+        "items": items,
+    }
+
+
+_CANVAS_HTML_CAP_BYTES = 256 * 1024
+_CANVAS_SLUG_RE = re.compile(r"[^a-z0-9\-_]+")
+
+
+def _canvas_slugify(title: str) -> str:
+    """Turn a free-form title into a slug. Lowercase, dashed, ≤64 chars.
+    Falls back to a short uuid if the input has no usable characters."""
+    if not title:
+        return uuid.uuid4().hex[:8]
+    slug = _CANVAS_SLUG_RE.sub("-", title.lower()).strip("-")[:64]
+    return slug or uuid.uuid4().hex[:8]
+
+
+def _canvas_save_artifact(slug: str, title: str, html: str,
+                            thread_id: str | None = None,
+                            meta: dict | None = None) -> str:
+    """Upsert a canvas artifact. Returns the slug used. Slugifies the
+    title if no slug is supplied. Raises ValueError on oversize HTML."""
+    if not isinstance(html, str):
+        raise ValueError("html must be a string")
+    if len(html.encode("utf-8", errors="replace")) > _CANVAS_HTML_CAP_BYTES:
+        raise ValueError(
+            f"html exceeds {_CANVAS_HTML_CAP_BYTES} byte cap "
+            f"({len(html.encode('utf-8', errors='replace'))} bytes). "
+            f"Trim inlined assets or split into multiple artifacts."
+        )
+    slug = (slug or "").strip() or _canvas_slugify(title)
+    now = time.time()
+    conn = db._get_conn()
+    existing = conn.execute(
+        "SELECT created_at FROM canvas_artifacts WHERE slug=?", (slug,)
+    ).fetchone()
+    created_at = existing[0] if existing else now
+    conn.execute(
+        "INSERT OR REPLACE INTO canvas_artifacts "
+        "(slug, title, html, created_at, updated_at, thread_id, meta) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (slug, title or slug, html, created_at, now, thread_id,
+         json.dumps(meta) if meta else None)
+    )
+    conn.commit()
+    return slug
+
+
+@app.get("/api/canvas/artifacts")
+async def canvas_list_artifacts():
+    """List saved canvas artifacts (metadata only — no html bodies).
+    Sorted newest-updated first."""
+    rows = db.fetchall(
+        "SELECT slug, title, created_at, updated_at, thread_id "
+        "FROM canvas_artifacts ORDER BY updated_at DESC LIMIT 200"
+    )
+    return {"items": [
+        {"slug": r[0], "title": r[1],
+         "created_at": r[2], "updated_at": r[3],
+         "thread_id": r[4]}
+        for r in rows
+    ]}
+
+
+@app.get("/api/canvas/artifacts/{slug}")
+async def canvas_get_artifact(slug: str):
+    """Fetch a single artifact including its html body."""
+    row = db.fetchone(
+        "SELECT slug, title, html, created_at, updated_at, thread_id, meta "
+        "FROM canvas_artifacts WHERE slug=?", (slug,)
+    )
+    if not row:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    meta_json = row[6]
+    return {
+        "slug": row[0], "title": row[1], "html": row[2],
+        "created_at": row[3], "updated_at": row[4],
+        "thread_id": row[5],
+        "meta": json.loads(meta_json) if meta_json else None,
+    }
+
+
+@app.post("/api/canvas/artifacts")
+async def canvas_save_artifact_endpoint(data: dict):
+    """Save (upsert) a canvas artifact. Body: {slug?, title, html, thread_id?}."""
+    title = (data.get("title") or "").strip()
+    html = data.get("html") or ""
+    slug = (data.get("slug") or "").strip()
+    if not html:
+        return JSONResponse({"error": "html required"}, status_code=400)
+    try:
+        slug_used = _canvas_save_artifact(
+            slug=slug, title=title, html=html,
+            thread_id=data.get("thread_id"),
+            meta=data.get("meta") if isinstance(data.get("meta"), dict) else None,
+        )
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=413)
+    return {"slug": slug_used, "ok": True}
+
+
+@app.delete("/api/canvas/artifacts/{slug}")
+async def canvas_delete_artifact(slug: str):
+    """Delete a single artifact by slug."""
+    db.execute("DELETE FROM canvas_artifacts WHERE slug=?", (slug,))
+    return {"ok": True}
+
+
+@app.get("/api/presets")
+async def presets_list():
+    """List all installed presets."""
+    return {"items": presets.list_installed(), "active": presets.get_active()}
+
+
+@app.get("/api/presets/onboarding")
+async def presets_onboarding():
+    """Get onboarding content for the active preset."""
+    if not presets.should_show_onboarding():
+        return {"show": False}
+    text = presets.get_onboarding()
+    if not text:
+        return {"show": False}
+    info = presets.get_active_info()
+    presets.mark_onboarding_shown()
+    return {"show": True, "text": text, "name": info["name"] if info else ""}
+
+
+@app.post("/api/presets/deactivate")
+async def presets_deactivate():
+    """Deactivate the current preset (restores the soul backup)."""
+    current = presets.get_active()
+    if not current:
+        return {"ok": True, "was_active": None}
+    presets.deactivate()
+    return {"ok": True, "was_active": current}
+
+
+@app.post("/api/presets/install")
+async def presets_install(request: Request):
+    """Upload and install a .qwp archive from the user's computer."""
+    _log.info("preset install: upload started")
+    staged = await _stage_upload(request, "presets", default_name="preset.qwp")
+    if isinstance(staged, JSONResponse):
+        _log.warning(f"preset install: upload rejected: {staged.body}")
+        return staged
+    _log.info(f"preset install: file staged at {staged.path} ({staged.size} bytes, name={staged.name})")
+    overwrite = staged.extras.get("overwrite", "") in ("1", "true", "yes")
+
+    try:
+        _log.info(f"preset install: loading from {staged.path}")
+        info = presets.load_any(str(staged.path))
+        _log.info(f"preset install: loaded {info.id} v{info.version}, validating...")
+        errors = presets.validate(info)
+        if errors:
+            _log.warning(f"preset install: validation failed: {errors}")
+            return JSONResponse(
+                {"error": "validation failed", "details": errors},
+                status_code=400,
+            )
+        _log.info(f"preset install: validation passed, installing...")
+        result = presets.install(info, overwrite=overwrite)
+    except FileExistsError as e:
+        _log.info(f"preset install: already exists: {e}")
+        return JSONResponse(
+            {"error": _sanitize_err(e), "code": "already_installed"},
+            status_code=409,
+        )
+    except Exception as e:
+        _log.error(f"preset install failed: {e}", exc_info=True)
+        return JSONResponse({"error": _sanitize_err(e)}, status_code=400)
+    finally:
+        try:
+            staged.path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    _log.info(f"preset installed via web: {result['id']} v{result['version']}")
+    return result
+
+
+@app.post("/api/presets/{preset_id}/activate")
+async def presets_activate(preset_id: str):
+    """Activate a preset. Deactivates the current one first."""
+    try:
+        return presets.activate(preset_id)
+    except Exception as e:
+        _log.error(f"preset activate failed: {e}", exc_info=True)
+        return JSONResponse({"error": _sanitize_err(e)}, status_code=400)
+
+
+@app.get("/api/presets/{preset_id}")
+async def presets_info(preset_id: str):
+    """Get full manifest of an installed preset. (Catch-all — must be after
+    literal `/api/presets/onboarding` etc.)"""
+    info = presets.get_info(preset_id)
+    if not info:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return info
+
+
+@app.delete("/api/presets/{preset_id}")
+async def presets_delete(preset_id: str):
+    """Uninstall a preset. Deactivates it first if active."""
+    try:
+        presets.uninstall(preset_id)
+    except Exception as e:
+        _log.error(f"preset uninstall failed: {e}", exc_info=True)
+        return JSONResponse({"error": _sanitize_err(e)}, status_code=400)
+    return {"ok": True, "id": preset_id}
+
+
+@app.post("/api/knowledge/upload")
+async def knowledge_upload(request: Request):
+    """Upload a file from the user's computer to the uploads directory.
+
+    Returns its absolute path so the frontend can immediately stage it
+    for indexing (without roundtripping through the LLM / chat).
+    """
+    staged = await _stage_upload(request, "kb", default_name="file.txt")
+    if isinstance(staged, JSONResponse):
+        return staged
+    _log.info(f"kb upload: {staged.name} → {staged.path} ({staged.size} bytes)")
+    return {
+        "path": str(staged.path.resolve()),
+        "name": staged.name,
+        "size": staged.size,
+        "ext": staged.ext or ".txt",
+    }
+
+
+@app.post("/api/knowledge/scan")
+async def knowledge_scan(data: dict):
+    """Scan a path and return file preview for indexing."""
+    path = data.get("path", "").strip()
+    if not path:
+        return JSONResponse({"error": "Path required"}, status_code=400)
+
+    try:
+        p = _validate_home_path(path)
+    except ValueError as e:
+        return JSONResponse({"error": _sanitize_err(e)}, status_code=403)
+    except FileNotFoundError as e:
+        return JSONResponse({"error": _sanitize_err(e)}, status_code=404)
+
+    recursive = data.get("recursive", True)
+    result = rag.scan_path(str(p), recursive=recursive)
+    return result
+
+
+def _url_resolves_to_private(url: str) -> str | None:
+    """Return an error message if the URL resolves to a private/loopback/link-local
+    address (or unspecified 0.0.0.0 / ::), else None. Uses ``socket.getaddrinfo``
+    so DNS rebinding to a private IP is caught too, not just literal IPs.
+    """
+    try:
+        host = urlparse(url).hostname
+    except Exception:
+        return "Invalid URL"
+    if not host:
+        return "URL is missing a hostname"
+
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception as e:
+        return f"Could not resolve hostname: {e}"
+
+    for info in infos:
+        addr = info[4][0]
+
+        if "%" in addr:
+            addr = addr.split("%", 1)[0]
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            continue
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_unspecified:
+            return (
+                f"Private/loopback URLs not allowed (resolved to {addr}). "
+                "Set CASTOR_ALLOW_PRIVATE_URLS=1 to override."
+            )
+    return None
+
+
+@app.post("/api/knowledge/url")
+async def knowledge_url(data: dict):
+    """Fetch a URL, extract readable text, and index it. Runs in the background.
+
+    Body: {"url": "https://…", "tags": ["optional","list"]}
+    """
+    global _knowledge_task
+    url = (data.get("url") or "").strip()
+    if not url:
+        return JSONResponse({"error": "URL required"}, status_code=400)
+    if not url.startswith(("http://", "https://")):
+        return JSONResponse({"error": "URL must start with http:// or https://"}, status_code=400)
+
+
+    if os.environ.get("CASTOR_ALLOW_PRIVATE_URLS", "").strip() != "1":
+        err = _url_resolves_to_private(url)
+        if err:
+            return JSONResponse({"error": err}, status_code=403)
+    tags_raw = data.get("tags", [])
+    tags = [t.strip() for t in tags_raw if isinstance(t, str) and t.strip()] if tags_raw else []
+
+
+    with _knowledge_lock:
+        if _knowledge_task and _knowledge_task.get("status") == "running":
+            return JSONResponse({"error": "Indexing already in progress"}, status_code=409)
+
+    task_id = tasks.register("knowledge_url", f"Fetching {url}")
+    with _knowledge_lock:
+        _knowledge_task = {
+            "task_id": task_id, "status": "running",
+            "current": 0, "total": 1, "file": url, "phase": "fetch", "errors": [],
+            "started_at": time.time(),
+        }
+
+    def _run_url():
+        start = time.time()
+        result: dict = {}
+        ok = False
+        try:
+            result = rag.index_url(url, tags=tags)
+            ok = result.get("status") == "indexed"
+            with _knowledge_lock:
+                if ok:
+                    _knowledge_task.update({
+                        "status": "done", "current": 1,
+                        "file": result.get("path", url),
+                        "phase": "done",
+                    })
+                else:
+                    _knowledge_task["errors"].append(f"{url}: {result.get('status')}")
+                    _knowledge_task.update({"status": "done", "current": 1, "phase": "done"})
+        except Exception as e:
+            _log.error(f"URL index error {url}: {e}", exc_info=True)
+            with _knowledge_lock:
+                _knowledge_task["errors"].append(f"{url}: {e}")
+                _knowledge_task.update({"status": "done", "current": 1, "phase": "done"})
+            result = {"status": f"error: {e}"}
+        finally:
+            duration = round(time.time() - start, 2)
+            chunks = result.get("chunks", 0) if isinstance(result, dict) else 0
+            converter = result.get("converter", "") if isinstance(result, dict) else ""
+            label = result.get("title") if isinstance(result, dict) and result.get("title") else url
+
+            try:
+                tasks.update(task_id, "done" if ok else "error",
+                             f"{chunks} chunks via {converter}" if ok else result.get("status", "failed"))
+            except Exception:
+                pass
+            has_t = result.get("has_transcript") if isinstance(result, dict) else None
+            fb = result.get("fallback_reason", "") if isinstance(result, dict) else ""
+
+
+            entry_status = "error" if not ok else ("partial" if has_t is False else "done")
+            _push_history({
+                "kind": "url",
+                "label": label[:120],
+                "url": url,
+                "status": entry_status,
+                "chunks": chunks,
+                "duration_sec": duration,
+                "converter": converter,
+                "has_transcript": has_t,
+                "fallback_reason": fb,
+                "errors": list(_knowledge_task.get("errors", [])) if _knowledge_task else [],
+            })
+
+    threading.Thread(target=_run_url, daemon=True).start()
+    return {"task_id": task_id, "status": "started", "url": url}
+
+
+@app.post("/api/knowledge/index")
+async def knowledge_index(data: dict):
+    """Start background indexing of selected files (or URLs)."""
+    global _knowledge_task
+
+    files = data.get("files", [])
+    tags_raw = data.get("tags", [])
+    tags = [t.strip() for t in tags_raw if isinstance(t, str) and t.strip()] if tags_raw else []
+    if not files:
+        return JSONResponse({"error": "No files to index"}, status_code=400)
+
+
+    home = Path.home().resolve()
+    uploads = UPLOADS_DIR.resolve()
+    for f in files:
+        src = f.get("path") or f.get("url", "")
+        if isinstance(src, str) and src.startswith(("http://", "https://")):
+            continue
+        fp = Path(src).resolve()
+        ok = False
+        for allowed in (home, uploads):
+            try:
+                fp.relative_to(allowed)
+                ok = True
+                break
+            except ValueError:
+                continue
+        if not ok:
+            return JSONResponse({"error": f"Access denied: {src}"}, status_code=403)
+
+    with _knowledge_lock:
+        if _knowledge_task and _knowledge_task.get("status") == "running":
+            return JSONResponse({"error": "Indexing already in progress"}, status_code=409)
+
+    task_id = tasks.register("knowledge_index", f"Indexing {len(files)} files")
+
+    with _knowledge_lock:
+        _knowledge_task = {
+            "task_id": task_id,
+            "status": "running",
+            "current": 0,
+            "total": len(files),
+            "file": "",
+            "phase": "cpu",
+            "errors": [],
+            "started_at": time.time(),
+        }
+
+    thread = threading.Thread(target=_run_knowledge_index, args=(task_id, files, tags), daemon=True)
+    thread.start()
+
+    return {"task_id": task_id, "status": "started", "total": len(files)}
+
+
+@app.get("/api/knowledge/status")
+async def knowledge_status():
+    """Get current indexing status."""
+    with _knowledge_lock:
+        if _knowledge_task:
+            return dict(_knowledge_task)
+    return {"status": "idle"}
+
+
+@app.get("/api/knowledge/recent")
+async def knowledge_recent():
+    """Last 20 completed indexing runs (URL, file, batch). Newest first.
+
+    Powers the "Recent activity" card in the Memory view so you can see
+    what just got indexed, how many chunks landed, and whether anything
+    errored — without fishing through logs.
+    """
+    return {"items": list(_knowledge_history)}
+
+
+@app.get("/api/knowledge/graph")
+async def knowledge_graph():
+    """Get entity graph data for visualization."""
+    entities = mem.get_all_entities(limit=200)
+
+
+    from collections import defaultdict
+    _by_name = defaultdict(list)
+    for e in entities:
+        _by_name[(e.get("name") or "").strip().casefold()].append(e)
+    entities = [mem.merge_entity_group(grp) for key, grp in _by_name.items() if key]
+
+
+    nodes = []
+    links = []
+    node_names = set()
+    for e in entities:
+        nodes.append({
+            "id": e["name"],
+            "type": e["type"],
+            "description": e["description"],
+            "weight": e["observation_count"],
+        })
+        node_names.add(e["name"])
+
+
+    for e in entities:
+        for rel in e.get("relations", []):
+            target = rel.get("to", "")
+            if target in node_names:
+                links.append({
+                    "source": e["name"],
+                    "target": target,
+                    "rel": rel.get("rel", "related"),
+                })
+
+    return {"nodes": nodes, "links": links}
+
+
+@app.post("/api/knowledge/graph/clear")
+async def knowledge_graph_clear():
+    """Clear all entities and wiki from the knowledge graph."""
+    mem.clear_graph()
+    return {"ok": True, "message": "Graph cleared — entities and wiki removed"}
+
+
+@app.post("/api/knowledge/graph/dedupe")
+async def knowledge_graph_dedupe():
+    """Collapse same-named duplicate entity nodes into one each.
+
+    Non-destructive merge (relations + observation_count preserved); only the
+    redundant copies are removed. Fixes the duplicate-spawn from legacy
+    synthesis (a fresh node per run instead of updating the existing one)."""
+    res = mem.dedupe_entities()
+    return {"ok": True, "groups": res["groups"], "removed": res["removed"],
+            "message": f"Merged {res['groups']} duplicate group(s), removed {res['removed']} node(s)"}
+
+
+@app.post("/api/knowledge/reindex")
+async def knowledge_reindex(skip_existing: bool = True):
+    """Re-embed every markdown atom under ``~/.castor/memories/atoms/`` and
+    upsert it into Qdrant + FTS5 — recovery path for a desync where the
+    canonical markdown layer survived but the derived search indexes are
+    empty.
+
+    Symptom this fixes: ``memory.search`` returns 0 / knowledge graph
+    view is empty, but ``GET /api/memory/list?tag=entity`` (which reads
+    the markdown layer) returns rows.
+
+    ``skip_existing`` (default True) skips any atom whose id is already
+    in Qdrant — repeat calls are no-ops on a healthy install.
+
+    Returns stats ``{scanned, written, skipped, errors}``.
+    """
+    stats = mem.reindex_from_markdown(skip_existing=skip_existing)
+    return {"ok": True, **stats}
+
+
+@app.get("/api/knowledge/list")
+async def knowledge_list():
+    """List indexed files. When preset active, show only preset's files."""
+    files = rag.list_indexed_files()
+    try:
+        active = presets.get_active()
+        if active:
+            tag = f"preset:{active}"
+            files = [f for f in files if tag in (f.get("tags") or [])]
+    except Exception:
+        pass
+    return {"files": files}
+
+
+@app.post("/api/knowledge/search")
+async def knowledge_search(data: dict):
+    """Search indexed knowledge base."""
+    query = data.get("query", "").strip()
+    if not query:
+        return JSONResponse({"error": "Query required"}, status_code=400)
+    limit = min(int(data.get("limit", 10)), 50)
+    tags = data.get("tags")
+    if tags and isinstance(tags, list):
+        tags = [t for t in tags if isinstance(t, str) and t.strip()]
+    else:
+        tags = None
+    try:
+        results = rag.search(query, limit=limit, tags=tags)
+        return {"results": results}
+    except Exception as e:
+        return JSONResponse({"error": _sanitize_err(e)}, status_code=500)
+
+
+@app.delete("/api/knowledge/file")
+async def knowledge_delete(request: Request):
+    """Delete a file from the index."""
+    path = request.query_params.get("path", "").strip()
+    if not path:
+        return JSONResponse({"error": "Path required"}, status_code=400)
+
+    home = str(Path.home().resolve())
+    fp = Path(path).resolve()
+    try:
+        fp.relative_to(home)
+    except ValueError:
+        return JSONResponse({"error": f"Access denied: {path}"}, status_code=403)
+
+    result = rag.delete_file(path)
+    return result
+
+
+@app.get("/api/commands")
+async def list_commands(surface: str = "web"):
+    """List slash commands exposed on a given surface.
+
+    Query param ``surface`` is one of ``"cli"``, ``"tg"``, ``"web"``
+    (default: ``"web"``). Unknown values return an empty list, not an
+    error — keeps the autocomplete UX silent in misconfigured clients.
+
+    Each entry: ``{name, description, category, aliases, args_hint}``.
+    """
+    import commands as _cmd_registry
+    cmds = _cmd_registry.for_surface(surface)
+    return {
+        "surface": surface,
+        "commands": [
+            {
+                "name": c.name,
+                "description": c.description,
+                "category": c.category,
+                "aliases": list(c.aliases),
+                "args_hint": c.args_hint,
+            }
+            for c in cmds
+        ],
+    }
+
+
+@app.get("/api/skills")
+async def list_skills():
+    """List all skills with status."""
+    return skills.list_all()
+
+
+@app.post("/api/skills/import")
+async def import_skill_endpoint(data: dict):
+    """Import a skill from skills.sh or a GitHub URL.
+
+    Body:
+        {
+            "url": "https://skills.sh/<owner>/<repo>/<name>",
+            "overwrite": false,          // optional, replace existing user skill
+            "accept_license": false      // optional, required for non-OSS licenses
+        }
+
+    Returns the install summary (name, description, license, paths,
+    file count, hash). The Skills list UI calls /api/skills again
+    after a successful import to surface the new entry.
+    """
+    from skills import skill_import
+    url = (data.get("url") or "").strip()
+    if not url:
+        return JSONResponse({"error": "url required"}, status_code=400)
+    try:
+        result = skill_import.import_skill(
+            url=url,
+            overwrite=bool(data.get("overwrite")),
+            accept_license=bool(data.get("accept_license")),
+        )
+    except skill_import.SkillImportError as e:
+        payload = {"error": str(e), "code": e.code}
+        if e.details:
+            payload["details"] = e.details
+        return JSONResponse(payload, status_code=e.status)
+    return result
+
+
+@app.get("/api/skills/imports")
+async def list_skill_imports():
+    """List all imported skills with their provenance (source URL,
+    license, imported_at). Used by the Skills tab to badge entries
+    that came from external sources."""
+    from skills import skill_import
+    return {"items": skill_import.list_imports()}
+
+
+@app.delete("/api/skills/imports/{name}")
+async def delete_skill_import(name: str):
+    """Remove an imported skill — deletes the adapter .py, staged
+    assets, and the provenance record. Built-in skills are not
+    importable in the first place, so this only ever affects
+    user-installed imports."""
+    from skills import skill_import
+    ok = skill_import.delete_import(name)
+    return {"ok": True, "deleted_any": ok}
+
+
+@app.post("/api/skills/{name}")
+async def toggle_skill(name: str, data: dict):
+    """Enable or disable a skill."""
+    if data.get("active"):
+        return {"result": skills.enable(name)}
+    else:
+        return {"result": skills.disable(name)}
+
+
+@app.get("/api/threads")
+async def list_threads(include_archived: bool = False):
+    """List all threads with stats. Filters by active preset if one is active."""
+    all_threads = threads.list_all(include_archived=include_archived)
+
+    try:
+        active_preset = presets.get_active()
+        if active_preset:
+
+            info = presets.get_info(active_preset)
+            prefix = f"Preset: {info['name']}" if info else "Preset:"
+            all_threads = [t for t in all_threads if t["name"].startswith(prefix)]
+        else:
+
+            all_threads = [t for t in all_threads if not t["name"].startswith("Preset:")]
+    except Exception:
+        pass
+
+    stats_rows = db.fetchall("""
+        SELECT thread_id,
+               COALESCE(SUM(LENGTH(content)), 0) / 4 AS est_tokens,
+               SUM(CASE WHEN role='user' THEN 1 ELSE 0 END) AS user_msgs,
+               SUM(CASE WHEN role='assistant' THEN 1 ELSE 0 END) AS asst_msgs,
+               SUM(CASE WHEN role='tool' THEN 1 ELSE 0 END) AS tool_msgs
+        FROM messages GROUP BY thread_id
+    """)
+    stats = {r[0]: {"est_tokens": r[1], "user_messages": r[2],
+                     "assistant_messages": r[3], "tool_calls": r[4]} for r in stats_rows}
+
+    try:
+        interrupted_rows = db.fetchall("""
+            SELECT thread_id, COUNT(*) AS cnt
+            FROM agent_runs
+            WHERE status='aborted'
+              AND dismissed_at IS NULL
+              AND resumed_from_run_id IS NULL
+              AND id NOT IN (
+                  SELECT resumed_from_run_id FROM agent_runs
+                  WHERE resumed_from_run_id IS NOT NULL
+              )
+            GROUP BY thread_id
+        """)
+        interrupted_counts = {r[0]: r[1] for r in interrupted_rows}
+    except Exception:
+        interrupted_counts = {}
+    for t in all_threads:
+        s = stats.get(t["id"], {})
+        t["est_tokens"] = s.get("est_tokens", 0)
+        t["user_messages"] = s.get("user_messages", 0)
+        t["assistant_messages"] = s.get("assistant_messages", 0)
+        t["tool_calls"] = s.get("tool_calls", 0)
+        totals = db.get_thread_totals(t["id"])
+        t["input_tokens"] = totals["input_tokens"] if totals["run_count"] else None
+        t["output_tokens"] = totals["output_tokens"] if totals["run_count"] else None
+        t["cost_usd"] = totals["cost_usd"] if totals["run_count"] else None
+        t["run_count"] = totals["run_count"]
+        t["interrupted_count"] = int(interrupted_counts.get(t["id"], 0))
+    return all_threads
+
+
+@app.post("/api/threads")
+async def create_thread(data: dict):
+    """Create a new thread."""
+    name = data.get("name", "New Thread")
+    t = threads.create(name, meta=data.get("meta"), source="web")
+
+    seed = data.get("seed_message")
+    if seed:
+        db.save_message("assistant", seed, thread_id=t["id"])
+    return t
+
+
+@app.get("/api/threads/{thread_id}/stats")
+async def thread_stats(thread_id: str):
+    """Get stats for a specific thread."""
+    t = threads.get(thread_id)
+    if not t:
+        return JSONResponse({"error": "not found"}, status_code=404)
+
+    user_msgs = db.fetchone("SELECT COUNT(*) FROM messages WHERE thread_id=? AND role='user'", (thread_id,))[0]
+    asst_msgs = db.fetchone("SELECT COUNT(*) FROM messages WHERE thread_id=? AND role='assistant'", (thread_id,))[0]
+    tool_msgs = db.fetchone("SELECT COUNT(*) FROM messages WHERE thread_id=? AND role='tool'", (thread_id,))[0]
+
+    first = db.fetchone("SELECT ts FROM messages WHERE thread_id=? ORDER BY id ASC LIMIT 1", (thread_id,))
+    last = db.fetchone("SELECT ts FROM messages WHERE thread_id=? ORDER BY id DESC LIMIT 1", (thread_id,))
+
+    row = db.fetchone("SELECT COALESCE(SUM(LENGTH(content)),0) FROM messages WHERE thread_id=?", (thread_id,))
+    est_tokens = row[0] // 4 if row else 0
+
+    return {
+        "thread_id": thread_id, "name": t["name"],
+        "user_messages": user_msgs, "assistant_messages": asst_msgs,
+        "tool_calls": tool_msgs, "total_messages": t["messages"],
+        "est_tokens": est_tokens,
+        "created_at": t["created_at"],
+        "first_message": first[0] if first else None,
+        "last_message": last[0] if last else None,
+        "model": t.get("meta", {}).get("model"),
+    }
+
+
+@app.get("/api/threads/{thread_id}/runs")
+async def get_thread_runs(thread_id: str, limit: int = 50, offset: int = 0):
+    """Per-thread agent run history, newest first."""
+    global _cost_tracking_first_use_seen
+    if not _cost_tracking_first_use_seen:
+        _cost_tracking_first_use_seen = True
+        try:
+            import telemetry
+            telemetry.track_event("feature_first_use", {"feature": "cost_tracking"})
+        except Exception:
+            pass
+    return db.get_runs_for_thread(thread_id, limit=limit, offset=offset)
+
+
+@app.post("/api/resume/{run_id}")
+async def resume_run_endpoint(run_id: int, background_tasks: BackgroundTasks):
+    """Trigger resume of an aborted agent run. Returns immediately;
+    streaming output flows via WS."""
+    global _auto_resume_first_use_seen
+    if not _auto_resume_first_use_seen:
+        _auto_resume_first_use_seen = True
+        try:
+            import telemetry
+            telemetry.track_event("feature_first_use", {"feature": "auto_resume"})
+        except Exception:
+            pass
+    row = db._get_conn().execute(
+        "SELECT status, dismissed_at, resumed_from_run_id FROM agent_runs WHERE id=?",
+        (run_id,),
+    ).fetchone()
+    if not row:
+        return JSONResponse({"ok": False, "error": "not found"}, status_code=404)
+    status, dismissed_at, already_resume = row
+    if status != "aborted":
+        return JSONResponse(
+            {"ok": False, "error": f"not aborted (status={status})"},
+            status_code=400,
+        )
+    if dismissed_at is not None:
+        return JSONResponse(
+            {"ok": False, "error": "was dismissed"},
+            status_code=400,
+        )
+    if already_resume is not None:
+        return JSONResponse(
+            {"ok": False, "error": "is itself a resume run"},
+            status_code=400,
+        )
+
+    fwd = db._get_conn().execute(
+        "SELECT id FROM agent_runs WHERE resumed_from_run_id=?", (run_id,)
+    ).fetchone()
+    if fwd:
+        return JSONResponse(
+            {"ok": False, "error": f"already resumed by run #{fwd[0]}"},
+            status_code=400,
+        )
+
+
+    with _RESUME_LOCK:
+        if _RESUME_IN_FLIGHT.get(run_id):
+            return JSONResponse(
+                {"ok": False, "error": "resume already in progress"},
+                status_code=409,
+            )
+        _RESUME_IN_FLIGHT[run_id] = True
+
+
+    import agent as _agent_mod
+
+    def _resume_and_clear():
+        try:
+            _agent_mod.resume_interrupted_run(run_id)
+        finally:
+            _RESUME_IN_FLIGHT.pop(run_id, None)
+
+    background_tasks.add_task(_resume_and_clear)
+    return {"ok": True}
+
+
+@app.post("/api/resume/{run_id}/dismiss")
+async def dismiss_run_endpoint(run_id: int):
+    """Mark an aborted run as dismissed so it is no longer offered for resume."""
+    row = db._get_conn().execute(
+        "SELECT id FROM agent_runs WHERE id=?", (run_id,)
+    ).fetchone()
+    if not row:
+        return JSONResponse({"ok": False, "error": "not found"}, status_code=404)
+    db.dismiss_run(run_id)
+    return {"ok": True}
+
+
+@app.post("/api/threads/{thread_id}/model")
+async def set_thread_model(thread_id: str, request: Request):
+    """Set a model override for a specific thread."""
+    req = await request.json()
+    model = req.get("model", "")
+    t = threads.get(thread_id)
+    if not t:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    meta = t.get("meta", {})
+    if model:
+        meta["model"] = model
+    else:
+        meta.pop("model", None)
+    db.execute("UPDATE threads SET meta=? WHERE id=?", (json.dumps(meta), thread_id))
+    return {"ok": True, "model": model or None}
+
+
+@app.get("/api/threads/active")
+async def active_thread():
+    """Get the active thread."""
+    tid = threads.get_active_id()
+    return threads.get(tid) or {"id": tid, "name": "Unknown"}
+
+
+@app.post("/api/threads/{thread_id}/switch")
+async def switch_thread(thread_id: str):
+    """Switch active thread."""
+    result = threads.switch(thread_id)
+    return {"result": result, "active": threads.get_active_id()}
+
+
+@app.put("/api/threads/{thread_id}")
+async def update_thread(thread_id: str, data: dict):
+    """Rename or update a thread."""
+    results = {}
+    if "name" in data:
+        results["rename"] = threads.rename(thread_id, data["name"])
+    if data.get("archived"):
+        results["archive"] = threads.archive(thread_id)
+    return results
+
+
+@app.delete("/api/threads/{thread_id}")
+async def delete_thread(thread_id: str):
+    """Delete a thread and its messages."""
+    return {"result": threads.delete(thread_id)}
+
+
+@app.post("/api/threads/{thread_id}/folder")
+async def thread_set_folder(thread_id: str, data: dict):
+    """Move a thread to a folder. ``{folder: "Name"}`` or
+    ``{folder: null}`` / ``{folder: ""}`` to ungroup."""
+    result = threads.set_folder(thread_id, data.get("folder"))
+    if "error" in result:
+        return JSONResponse(result, status_code=404)
+    return result
+
+
+@app.get("/api/folders")
+async def list_thread_folders():
+    """All distinct non-empty folder names currently in use."""
+    return {"folders": threads.list_folders()}
+
+
+@app.post("/api/threads/{thread_id}/regenerate")
+async def regenerate_turn(thread_id: str):
+    """Erase the last user → assistant turn so the client can re-send a fresh prompt.
+
+    Behaviour:
+      1. Walk messages for this thread newest-first, collect rows since the last
+         user message (inclusive). That's the "last turn" — assistant reply,
+         any tool traces, and the triggering user message.
+      2. Delete those rows.
+      3. Return the user's original text + attachments so the client can re-submit
+         via the normal WebSocket path. From the agent's perspective it's a fresh
+         prompt — no "this is a regeneration" signal leaks into context.
+    """
+    rows = db.fetchall(
+        "SELECT id, role, content, meta FROM messages WHERE thread_id=? ORDER BY id DESC",
+        (thread_id,)
+    )
+    if not rows:
+        return JSONResponse({"error": "empty thread"}, status_code=400)
+
+    to_delete: list[int] = []
+    user_text = ""
+    user_meta = None
+    for mid, role, content, meta_json in rows:
+        to_delete.append(mid)
+        if role == "user":
+            user_text = content or ""
+            try:
+                user_meta = json.loads(meta_json) if meta_json else None
+            except Exception:
+                user_meta = None
+            break
+    if not user_text:
+        return JSONResponse({"error": "no user message in recent turn"}, status_code=400)
+
+    db.delete_messages_by_ids(to_delete)
+    _log.info(f"regenerate: deleted {len(to_delete)} messages in thread {thread_id}")
+    return {
+        "ok": True,
+        "deleted": len(to_delete),
+        "user_text": user_text,
+        "meta": user_meta or {},
+    }
+
+
+async def _check_for_resumable_interrupt(ws: WebSocket, thread_id: str) -> None:
+    """Probe for one resumable aborted run in this thread; emit event on hit."""
+    try:
+        ttl = float(config.get("resume_ttl_web_sec") or 604800)
+    except Exception:
+        ttl = 604800
+    row = db.get_resumable_run_for_thread(thread_id, source_filter=None, ttl_sec=ttl)
+    if not row or row.get("source") == "cli":
+        return
+    try:
+        await ws.send_json({
+            "event": "interrupted_turn",
+            "run_id": row["id"],
+            "started_at": row["started_at"],
+            "preview": row.get("result_preview") or "",
+            "model": row.get("model"),
+            "source": row.get("source"),
+            "thread_id": thread_id,
+        })
+    except Exception as e:
+        _log.debug(f"interrupted_turn send failed: {e}")
+
+
+async def _ws_send_safe(ws: WebSocket, data: dict) -> bool:
+    """Send JSON to a WebSocket, returning False if the connection is dead."""
+    try:
+        await ws.send_json(data)
+        return True
+    except (WebSocketDisconnect, ConnectionResetError, RuntimeError, OSError):
+        return False
+    except Exception:
+        _log.debug("ws send failed", exc_info=True)
+        return False
+
+
+@app.websocket("/ws")
+async def websocket_chat(ws: WebSocket):
+    global _ws_loop
+
+
+    my_abort_event = threading.Event()
+
+
+    if _AUTH_PASSWORD:
+        cookie = ws.cookies.get(_AUTH_COOKIE, "")
+        if not hmac.compare_digest(cookie, _AUTH_TOKEN):
+            await ws.close(code=4001, reason="unauthorized")
+            return
+
+    await ws.accept()
+    with _ws_lock:
+        _ws_clients.add(ws)
+    with _ws_abort_lock:
+        _ws_abort_events.add(my_abort_event)
+    _ws_loop = asyncio.get_event_loop()
+    _log.info(f"websocket client connected ({len(_ws_clients)} total)")
+
+
+    await _check_for_resumable_interrupt(ws, threads.get_active_id() or "default")
+
+    try:
+        while True:
+            data = await ws.receive_text()
+            try:
+                msg = json.loads(data)
+
+
+                if msg.get("type") == "frame_response":
+                    req_id = msg.get("request_id")
+                    if req_id and req_id in _pending_frame_requests:
+                        _pending_frame_requests[req_id]["image_b64"] = msg.get("image_b64")
+                        _pending_frame_requests[req_id]["event"].set()
+                    continue
+
+
+                if msg.get("type") == "canvas_event":
+                    event_kind = msg.get("event")
+                    req_id = msg.get("request_id")
+                    if event_kind == "submit":
+                        if req_id and req_id in _pending_canvas_prompts:
+                            _pending_canvas_prompts[req_id]["data"] = msg.get("data") or {}
+                            _pending_canvas_prompts[req_id]["event"].set()
+
+
+                        else:
+                            _log.info(f"canvas submit without pending request: {(msg.get('data') or {})}")
+                    elif event_kind == "close":
+                        if req_id and req_id in _pending_canvas_prompts:
+                            _pending_canvas_prompts[req_id]["closed"] = True
+                            _pending_canvas_prompts[req_id]["event"].set()
+
+
+                    continue
+
+                user_input = msg.get("text", "").strip()
+                thread_id = msg.get("thread_id")
+                image_b64 = msg.get("image_b64")
+                document = msg.get("document")
+                live_mode = bool(msg.get("live"))
+            except json.JSONDecodeError:
+                user_input = data.strip()
+                thread_id = None
+                image_b64 = None
+                document = None
+                live_mode = False
+
+            if not user_input and not image_b64 and not document:
+                continue
+
+
+            image_path = None
+            if image_b64:
+                try:
+                    img_id = str(uuid.uuid4())[:8]
+                    img_file = UPLOADS_DIR / f"{img_id}.png"
+                    img_file.write_bytes(base64.b64decode(image_b64))
+                    image_path = f"/uploads/{img_id}.png"
+                except Exception as e:
+                    _log.warning(f"failed to save ws image: {e}")
+
+
+            file_name = None
+            file_path = None
+            file_size = 0
+            if document:
+                try:
+                    doc_id = str(uuid.uuid4())[:8]
+                    fname_raw = document.get("filename", "file.txt")
+
+                    fname_safe = re.sub(r'[^\w.\-]+', '_', Path(fname_raw).name)[:80] or "file.txt"
+                    ext = Path(fname_safe).suffix or ".txt"
+                    stem = Path(fname_safe).stem
+                    doc_file = UPLOADS_DIR / f"{doc_id}_{stem}{ext}"
+                    doc_file.write_bytes(base64.b64decode(document["file_b64"]))
+                    file_name = fname_raw
+                    file_path = str(doc_file.resolve())
+                    file_size = doc_file.stat().st_size
+                    _log.info(f"document uploaded: {fname_raw} → {file_path} ({file_size} bytes)")
+                except Exception as e:
+                    _log.warning(f"failed to save document: {e}")
+
+
+            if file_path and file_name:
+                size_kb = file_size / 1024
+                ref = (
+                    f"[File attached: {file_name} ({size_kb:.1f} KB) — saved at {file_path}. "
+                    f"To view contents call read_file(path). "
+                    f"To add to the knowledge base call tool_search('rag') then rag_index(path).]"
+                )
+                user_input = (user_input + "\n\n" if user_input else "") + ref
+
+            _log.info(f"ws message: thread={thread_id or 'active'} | {user_input[:100]}" +
+                       (" [+image]" if image_b64 else "") +
+                       (f" [+doc:{file_name}]" if file_name else ""))
+
+
+            loading_msg = None
+            if providers.get_active_name() in ("lmstudio", "ollama"):
+                try:
+                    p = providers.get_provider()
+                    api_base = p.get("url", "").rstrip("/").replace("/v1", "")
+                    model = providers.get_model()
+                    r = requests.get(f"{api_base}/api/v1/models", timeout=5)
+                    if r.ok:
+                        models_data = r.json().get("models", [])
+                        model_loaded = any(
+                            m.get("key") == model and m.get("loaded_instances")
+                            for m in models_data
+                        )
+                        if not model_loaded:
+                            loading_msg = f"Loading model {model}..."
+                except Exception:
+                    pass
+
+
+            if not await _ws_send_safe(ws, {"type": "status", "text": loading_msg or "thinking..."}):
+                break
+
+            try:
+
+                loop = asyncio.get_event_loop()
+                stream_queue: asyncio.Queue = asyncio.Queue()
+
+                async def _drain_stream_queue():
+                    """Forward streamed chunks from agent thread to this WS client."""
+                    while True:
+                        msg = await stream_queue.get()
+                        if msg is None:
+                            break
+                        await _ws_send_safe(ws, msg)
+
+
+                file_meta = None
+                if file_path and file_name:
+                    file_meta = {"path": file_path, "name": file_name, "size": file_size}
+
+                def _run_with_queue(user_input, thread_id, image_b64, image_path, file_meta):
+                    """Wrap _run_agent_sync, routing content/thinking/status to queue.
+
+                    Builds a fresh :class:`turn_context.TurnContext` for this
+                    request so one WS client's callbacks / pending image /
+                    abort event can never leak into a concurrent turn (web
+                    elsewhere, telegram bot).
+                    """
+                    from turn_context import TurnContext
+
+                    def _queue_content(text):
+                        asyncio.run_coroutine_threadsafe(
+                            stream_queue.put({"type": "content_delta", "text": text}), loop)
+
+                    def _queue_thinking(text):
+                        asyncio.run_coroutine_threadsafe(
+                            stream_queue.put({"type": "thinking_delta", "text": text}), loop)
+
+                    def _queue_status(text):
+                        asyncio.run_coroutine_threadsafe(
+                            stream_queue.put({"type": "status", "text": text}), loop)
+
+                    def _queue_tool_call(name, args_preview, result_preview=""):
+                        asyncio.run_coroutine_threadsafe(
+                            stream_queue.put({"type": "tool_call", "name": name, "args": args_preview, "result": result_preview}), loop)
+
+                    def _queue_recall(memories):
+                        asyncio.run_coroutine_threadsafe(
+                            stream_queue.put({"type": "recall", "memories": memories}), loop)
+
+                    ws_ctx = TurnContext(
+                        abort_event=my_abort_event,
+                        source="web",
+                        image_path=image_path,
+                        file_meta=file_meta,
+                        on_content=_queue_content,
+                        on_thinking=_queue_thinking,
+                        on_status=_queue_status,
+                        on_tool_call=_queue_tool_call,
+                        on_recall=_queue_recall,
+                    )
+                    try:
+                        return _run_agent_sync(user_input, thread_id,
+                                               image_b64=image_b64,
+                                               image_path=image_path,
+                                               file_meta=file_meta,
+                                               abort_event=my_abort_event,
+                                               ctx=ws_ctx)
+                    finally:
+
+                        asyncio.run_coroutine_threadsafe(stream_queue.put(None), loop)
+
+
+                agent_task = loop.run_in_executor(
+                    None, functools.partial(_run_with_queue, user_input,
+                                            thread_id, image_b64, image_path, file_meta))
+                drain_task = asyncio.ensure_future(_drain_stream_queue())
+                result = await agent_task
+                await drain_task
+
+
+                audio_url = None
+                voice_mode = db.kv_get("voice_mode:web") == "1"
+                try:
+                    if (voice_mode or live_mode) and tts.is_available() and result["reply"]:
+                        audio_data = await loop.run_in_executor(
+                            None, functools.partial(tts.synthesize, result["reply"], format="mp3")
+                        )
+                        if audio_data:
+                            audio_id = str(uuid.uuid4())[:8]
+                            audio_file = UPLOADS_DIR / f"{audio_id}.mp3"
+                            audio_file.write_bytes(audio_data)
+                            audio_url = f"/uploads/{audio_id}.mp3"
+                except Exception as e:
+                    _log.debug(f"ws TTS skipped: {e}")
+
+
+                reply_payload = {
+                    "type": "reply",
+                    "text": result["reply"],
+                    "thinking": result.get("thinking", ""),
+                    "tools": result["tools"],
+                    "duration_ms": result["duration_ms"],
+                    "context_hits": result["context_hits"],
+                    "thread_id": result["thread_id"],
+                    "tokens": result.get("tokens", 0),
+                    "prompt_tokens": result.get("prompt_tokens", 0),
+                    "tok_per_sec": result.get("tok_per_sec", 0),
+                }
+                if audio_url:
+                    reply_payload["audio_url"] = audio_url
+
+                pending = tools.get_pending_files()
+
+
+                _turn_tid = result["thread_id"]
+                pending_canvases = _pending_canvas_renders.pop(_turn_tid, [])
+                if pending or pending_canvases:
+                    if pending:
+                        reply_payload["files"] = pending
+
+
+                    try:
+                        row = db.fetchone(
+                            "SELECT id, meta FROM messages WHERE thread_id=? AND role='assistant' ORDER BY id DESC LIMIT 1",
+                            (result["thread_id"],)
+                        )
+                        if row:
+                            mid, meta_raw = row
+                            meta_dict = json.loads(meta_raw) if meta_raw else {}
+                            if pending:
+                                meta_dict["files"] = pending
+                            if pending_canvases:
+                                meta_dict["canvas"] = pending_canvases
+                            if audio_url:
+                                meta_dict["audio_url"] = audio_url
+                            db.execute("UPDATE messages SET meta=? WHERE id=?",
+                                       (json.dumps(meta_dict), mid))
+                    except Exception as e:
+                        _log.debug(f"failed to persist files/canvas to message meta: {e}")
+                if not await _ws_send_safe(ws, reply_payload):
+                    break
+
+            except Exception as e:
+                _log.error(f"ws agent error: {e}", exc_info=True)
+                user_msg = _friendly_error(e)
+                if not await _ws_send_safe(ws, {"type": "error", "text": user_msg}):
+                    break
+
+    except WebSocketDisconnect:
+
+        my_abort_event.set()
+        _log.info("websocket client disconnected — aborting this session's agent turn")
+    except (ConnectionResetError, RuntimeError, OSError):
+        my_abort_event.set()
+        _log.debug("websocket connection reset — aborting this session's agent turn")
+    except Exception as e:
+        _log.error(f"websocket error: {e}", exc_info=True)
+    finally:
+        with _ws_lock:
+            _ws_clients.discard(ws)
+        with _ws_abort_lock:
+            _ws_abort_events.discard(my_abort_event)
+        _log.info(f"websocket client disconnected ({len(_ws_clients)} left)")
+
+
+async def _broadcast(msg: dict):
+    """Send JSON to all connected WebSocket clients."""
+    dead = set()
+    with _ws_lock:
+        clients = list(_ws_clients)
+    for ws in clients:
+        if not await _ws_send_safe(ws, msg):
+            dead.add(ws)
+    if dead:
+        with _ws_lock:
+            _ws_clients.difference_update(dead)
+
+
+def _is_system_task(name: str) -> bool:
+    """System/infrastructure cron tasks use the ``__name__`` convention
+    (heartbeat, synthesis, continuous synthesis, coach, trajectory prune).
+    They run on their own cadence and must NOT DM the owner — a 15-minute
+    "__synthesis_continuous__ No pending items" stream is pure chat noise."""
+    return name.startswith("__") and name.endswith("__")
+
+
+def _cron_callback(name: str, task: str, result: str):
+    """Called from scheduler thread when a cron task completes."""
+
+    if name == "__heartbeat__" and "HEARTBEAT_OK" in result:
+        _log.debug("heartbeat OK — silent")
+        return
+
+
+    if _ws_loop and _ws_clients:
+        msg = {
+            "type": "cron",
+            "name": name,
+            "task": task,
+            "text": result,
+        }
+        asyncio.run_coroutine_threadsafe(_broadcast(msg), _ws_loop)
+
+
+    if (not _is_system_task(name)
+            and telegram_bot.is_verified() and telegram_bot._running):
+        owner = telegram_bot.get_owner_id()
+        if owner:
+            truncated = result[:500] + ("..." if len(result) > 500 else "")
+
+            if result.startswith("🔔"):
+                telegram_bot.send_message(owner, truncated)
+            else:
+                telegram_bot.send_message(owner, f"⏰ **{name}**\n{truncated}")
+
+
+scheduler.on_complete(_cron_callback)
+
+
+import agent as _agent
+
+def _compaction_callback(event: str, data: dict):
+    """Notify WS clients and Telegram about compaction events."""
+
+    if _ws_loop and _ws_clients:
+        ws_msg = {"type": "compaction", "event": event, **data}
+        asyncio.run_coroutine_threadsafe(_broadcast(ws_msg), _ws_loop)
+
+
+    if event == "start":
+        _tg_notify_thread(data, f"🔄 Compacting memory: {data.get('messages', 0)} messages (~{data.get('tokens', 0)} tokens)...")
+    elif event == "summary":
+        summary = data.get("summary", "")[:200]
+        _tg_notify_thread(data, f"🧠 Saved to memory:\n_{summary}_")
+    elif event == "done":
+        _tg_notify_thread(data, f"✅ Compaction done. {data.get('remaining', 0)} messages remaining.")
+    elif event == "error":
+        _tg_notify_thread(data, f"⚠️ Compaction error: {data.get('error', '')[:100]}")
+
+
+def _tg_notify_thread(data: dict, text: str):
+    """Send notification to the Telegram chat/topic where the thread lives."""
+    if not telegram_bot.is_verified() or not telegram_bot._running:
+        return
+
+    thread_id = data.get("thread_id")
+    chat_id = None
+    topic_id = None
+
+
+    if thread_id:
+        t = threads.get(thread_id)
+        if t and t.get("meta"):
+            chat_id = t["meta"].get("telegram_chat_id")
+            topic_id = t["meta"].get("telegram_topic_id")
+
+
+    if not chat_id:
+        chat_id = telegram_bot.get_owner_id()
+
+    if chat_id:
+        telegram_bot.send_message(chat_id, text, topic_id=topic_id)
+
+
+_agent.on_compaction(_compaction_callback)
+
+
+import telegram_bot
+
+
+_TG_RICH_CAPABILITY_NOTE = (
+    "You're replying on Telegram, which renders full rich Markdown: headings, "
+    "tables, ordered/unordered/task lists, blockquotes, dividers, inline math "
+    "$x^2$ and display math $$...$$, spoilers ||text||, ==marked==, and inline "
+    "media via ![](https://url \"caption\") for images, audio, video, and GIFs. "
+    "Use these when they genuinely help; plain prose is fine for simple replies."
+)
+
+
+def _telegram_handler(chat_id: int, text: str, user_id: int, username: str,
+                      thread_id: str | None = None, image_b64: str | None = None) -> str:
+    """Handle incoming Telegram message → agent → response.
+
+    Consumes the per-request :class:`turn_context.TurnContext` that
+    ``telegram_bot`` stashed on its thread-local before calling us — this
+    keeps every concurrent chat's callbacks / abort event isolated.
+    """
+    import agent
+    tid = thread_id or db.kv_get("telegram:thread_id") or None
+    tg_ctx = telegram_bot.pop_active_ctx()
+    result = agent.run(text, thread_id=tid, source="telegram",
+                       image_b64=image_b64, ctx=tg_ctx,
+                       system_note=_TG_RICH_CAPABILITY_NOTE)
+
+
+    agent._last_tools = list(result.tool_calls_made) if result.tool_calls_made else []
+
+
+    if _ws_loop and _ws_clients:
+        ws_msg = {
+            "type": "telegram",
+            "from": f"@{username}" if username else str(user_id),
+            "text": text,
+            "reply": result.reply,
+        }
+        asyncio.run_coroutine_threadsafe(_broadcast(ws_msg), _ws_loop)
+
+    return result.reply
+
+
+@app.get("/api/mcp/presets")
+async def mcp_presets():
+    """Return the built-in MCP server preset catalogue for the UI picker."""
+    return {"presets": mcp_client.get_presets()}
+
+
+@app.get("/api/mcp/health")
+async def mcp_health():
+    """Fast MCP health summary: configured / running / tripped / tools_total."""
+    return mcp_client.health_check()
+
+
+@app.get("/api/mcp/servers")
+async def mcp_list_servers():
+    """List all configured MCP servers with status."""
+    return mcp_client.list_servers()
+
+
+@app.post("/api/mcp/servers")
+async def mcp_add_server(request: Request):
+    """Add or update an MCP server."""
+    data = await request.json()
+    name = data.get("name", "").strip()
+    if not name:
+        return JSONResponse({"error": "name required"}, status_code=400)
+    mcp_client.add_server(
+        name,
+        command=data.get("command", ""),
+        args=data.get("args", []),
+        env=data.get("env", {}),
+        url=data.get("url", ""),
+        transport=data.get("transport", "stdio"),
+        enabled=data.get("enabled", True),
+    )
+
+    if data.get("enabled", True):
+        result = mcp_client.start_server(name)
+        return {"ok": True, "message": result}
+    return {"ok": True, "message": f"MCP '{name}' saved (disabled)"}
+
+
+@app.delete("/api/mcp/servers/{name}")
+async def mcp_remove_server(name: str):
+    """Remove an MCP server."""
+    return {"ok": True, "message": mcp_client.remove_server(name)}
+
+
+@app.post("/api/mcp/servers/{name}/restart")
+async def mcp_restart_server(name: str):
+    """Restart an MCP server connection."""
+    result = mcp_client.start_server(name)
+    return {"ok": True, "message": result}
+
+
+@app.post("/api/mcp/servers/{name}/toggle")
+async def mcp_toggle_server(name: str, request: Request):
+    """Enable or disable an MCP server."""
+    data = await request.json()
+    enabled = bool(data.get("enabled", True))
+    config = mcp_client.load_config()
+    if name not in config:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    config[name]["enabled"] = enabled
+    mcp_client.save_config(config)
+    if enabled:
+        result = mcp_client.start_server(name)
+    else:
+        result = mcp_client.stop_server(name)
+    return {"ok": True, "message": result}
+
+
+@app.get("/api/telegram/status")
+async def telegram_status():
+    return telegram_bot.status()
+
+
+@app.post("/api/telegram/config")
+async def telegram_config(request: Request):
+    req = await request.json()
+    if "token" in req:
+        telegram_bot.set_token(req["token"])
+        me = telegram_bot.get_me(req["token"])
+        if not me:
+            return JSONResponse({"error": "Invalid token"}, status_code=400)
+        return {"ok": True, "username": me.get("username")}
+    if "group_mode" in req:
+        telegram_bot.set_group_mode(req["group_mode"])
+    if "topics_enabled" in req:
+        telegram_bot.set_topics_enabled(bool(req["topics_enabled"]))
+    if "allowed_groups" in req:
+        telegram_bot.set_allowed_groups(req["allowed_groups"])
+    return {"ok": True}
+
+
+@app.post("/api/telegram/toggle")
+async def telegram_toggle(request: Request):
+    req = await request.json()
+    enabled = bool(req.get("enabled", False))
+    telegram_bot.set_enabled(enabled)
+    if enabled:
+        telegram_bot.start(on_message=_telegram_handler)
+    else:
+        telegram_bot.stop()
+    return {"enabled": enabled, "running": telegram_bot._running}
+
+
+@app.post("/api/telegram/activate")
+async def telegram_activate(request: Request):
+    """Generate a new activation code. User sends this code to the bot in Telegram."""
+
+    if _AUTH_PASSWORD:
+        cookie = request.cookies.get(_AUTH_COOKIE, "")
+        if not hmac.compare_digest(cookie, _AUTH_TOKEN):
+            return JSONResponse({"error": "Auth required for telegram activation"}, status_code=401)
+    if telegram_bot.is_verified():
+        return JSONResponse({"error": "Already verified. Reset first to re-verify."}, status_code=400)
+    code = telegram_bot.generate_activation_code()
+    return {
+        "ok": True,
+        "code": code,
+        "ttl_seconds": telegram_bot.ACTIVATION_TTL,
+        "message": f"Send this code to the bot in Telegram: {code}"
+    }
+
+
+@app.post("/api/telegram/verify")
+async def telegram_verify(request: Request):
+    """Verify ownership with the code (legacy endpoint, redirects to activate)."""
+    req = await request.json()
+    code = req.get("code", "")
+    if telegram_bot.verify_code(code):
+        return {"ok": True, "verified": True}
+    return JSONResponse({"error": "Invalid code"}, status_code=400)
+
+
+@app.post("/api/telegram/reset")
+async def telegram_reset():
+    """Reset verification — disconnect owner."""
+    db.kv_set("telegram:owner_id", "")
+    db.kv_set("telegram:owner_username", "")
+    telegram_bot.clear_verification()
+    return {"ok": True}
+
+
+_current_port = 7860
+
+def _ensure_ssl_cert() -> tuple[str, str]:
+    """Generate a self-signed SSL certificate if one doesn't exist.
+
+    Returns (certfile, keyfile) paths inside DATA_DIR. The cert is valid
+    for 365 days and covers localhost + the machine's LAN IPs so mobile
+    browsers can connect over HTTPS and access getUserMedia (camera).
+    """
+    cert_path = config.DATA_DIR / "ssl" / "cert.pem"
+    key_path = config.DATA_DIR / "ssl" / "key.pem"
+    if cert_path.exists() and key_path.exists():
+        return str(cert_path), str(key_path)
+
+    cert_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+
+
+        from cryptography import x509
+        from cryptography.x509.oid import NameOID
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from datetime import datetime
+
+
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+
+        sans = [
+            x509.DNSName("localhost"),
+            x509.IPAddress(ipaddress.IPv4Address("127.0.0.1")),
+            x509.IPAddress(ipaddress.IPv6Address("::1")),
+        ]
+        lan_ip = _get_lan_ip()
+        if lan_ip:
+            try:
+                sans.append(x509.IPAddress(ipaddress.IPv4Address(lan_ip)))
+            except Exception:
+                pass
+
+        subject = x509.Name([
+            x509.NameAttribute(NameOID.COMMON_NAME, "castor"),
+        ])
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(subject)
+            .issuer_name(subject)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(datetime(2024, 1, 1))
+            .not_valid_after(datetime(2124, 1, 1))
+            .add_extension(
+                x509.SubjectAlternativeName(sans),
+                critical=False,
+            )
+            .sign(key, hashes.SHA256())
+        )
+
+        key_path.write_bytes(key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=serialization.NoEncryption(),
+        ))
+        cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+        _log.info(f"generated self-signed SSL cert: {cert_path}")
+    except Exception as e:
+        _log.error(f"SSL cert generation failed: {e}")
+        raise
+    return str(cert_path), str(key_path)
+
+
+def start(host: str = "0.0.0.0", port: int = 7860, ssl: bool = False):
+    """Start the web server.
+
+    Args:
+        ssl: When True, serve over HTTPS with a self-signed certificate.
+             Required for camera access from mobile devices over LAN.
+    """
+    global _current_port
+    _current_port = port
+
+    import uvicorn
+
+
+    if sys.platform == "win32":
+        _BENIGN = (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)
+
+        def _quiet_exception_handler(loop, context):
+            exc = context.get("exception")
+            msg = context.get("message", "") or ""
+            if isinstance(exc, _BENIGN):
+                return
+            if isinstance(exc, OSError) and "_call_connection_lost" in msg:
+                return
+            loop.default_exception_handler(context)
+
+
+        class _QuietPolicy(type(asyncio.get_event_loop_policy())):
+            def new_event_loop(self):
+                loop = super().new_event_loop()
+                loop.set_exception_handler(_quiet_exception_handler)
+                return loop
+        try:
+            asyncio.set_event_loop_policy(_QuietPolicy())
+        except Exception:
+            pass
+
+        try:
+            asyncio.get_event_loop().set_exception_handler(_quiet_exception_handler)
+        except RuntimeError:
+            pass
+
+
+        try:
+            # lazy: Windows-only internals; only patched on the win32 branch.
+            from asyncio.proactor_events import _ProactorBasePipeTransport
+            _orig = _ProactorBasePipeTransport._call_connection_lost
+
+            def _quiet_call_connection_lost(self, exc):
+                try:
+                    return _orig(self, exc)
+                except (OSError, ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+                    return None
+            _ProactorBasePipeTransport._call_connection_lost = _quiet_call_connection_lost
+        except Exception:
+            pass
+
+
+    lan_val = db.kv_get("network:lan_access")
+    lan = lan_val != "0"
+    actual_host = "0.0.0.0" if lan else "127.0.0.1"
+
+    if host != "0.0.0.0":
+        actual_host = host
+
+
+    if telegram_bot.is_enabled() and telegram_bot.get_token():
+        telegram_bot.start(on_message=_telegram_handler)
+
+
+    ssl_kwargs = {}
+    proto = "http"
+    if ssl:
+        try:
+            certfile, keyfile = _ensure_ssl_cert()
+            ssl_kwargs = {"ssl_certfile": certfile, "ssl_keyfile": keyfile}
+            proto = "https"
+        except Exception as e:
+            _log.warning(f"SSL disabled: {e}")
+
+    _log.info(f"starting web server on {actual_host}:{port} (LAN: {'on' if lan else 'off'}, SSL: {'on' if ssl_kwargs else 'off'})")
+    if actual_host == "0.0.0.0":
+        ip = _get_lan_ip()
+        _safe_print(f"\n  ⚡ castor web UI → {proto}://localhost:{port}")
+        if ip:
+            _safe_print(f"  📱 LAN access → {proto}://{ip}:{port}")
+        if ssl_kwargs:
+            _safe_print(f"  🔒 Self-signed cert — accept the browser warning on first connect")
+        elif ip:
+            _safe_print(f"  📷 For camera on mobile: restart with --ssl")
+        print()
+    else:
+        _safe_print(f"\n  ⚡ castor web UI → {proto}://localhost:{port}")
+        print(f"  🔒 Local only (enable LAN in Settings → System)\n")
+
+    uvicorn.run(app, host=actual_host, port=port, log_level="warning", **ssl_kwargs)
+
+
+if __name__ == "__main__":
+    start()

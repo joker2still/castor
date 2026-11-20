@@ -1,0 +1,229 @@
+"""Markdown-backed memory storage — canonical, inspectable, diffable.
+
+Phase 1 of the Living Memory architecture (see ``docs/adr/0001-living-memory.md``).
+
+Every memory that Qdrant holds has a parallel ``.md`` file under
+``~/.castor/memories/atoms/<shard>/mem_<id>.md`` with YAML frontmatter.
+On this layer, markdown is the **source of truth**; Qdrant is a derived
+search index rebuildable from the files.
+
+Phase 1 scope is storage-only: dual-write from save(), dual-delete,
+on-boot backfill of existing Qdrant points that have no markdown yet.
+Living Memory semantics (salience decay, anchors, typed connections,
+nightly mutation, crystallisation) arrive in later phases.
+
+Design notes:
+
+- Sharding by first 2 chars of the point_id (UUID hex) keeps at most
+  ~40 files per leaf directory under the default Qdrant UUID4 space,
+  even at 10k+ memories. Avoids Windows filesystem slowness on huge
+  single-directory listings.
+- YAML frontmatter is read by PyYAML (already a transitive dep). All
+  frontmatter keys the reader doesn't recognise are preserved on
+  round-trip — future phases can add fields without a migration.
+- Secret scrubbing happens in ``memory.save`` BEFORE we're called.
+  That's a deliberate contract: this module never sees unscrubbed text.
+"""
+from __future__ import annotations
+
+import logging
+import re
+from datetime import datetime, timezone
+from pathlib import Path
+
+import yaml
+
+import config
+
+_log = logging.getLogger("qwe.memory_store")
+
+
+def memories_root() -> Path:
+    """Root of the markdown memory store. Created on first access."""
+    p = config.DATA_DIR / "memories"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _atoms_dir() -> Path:
+    return memories_root() / "atoms"
+
+
+def _shard_for(point_id: str) -> str:
+    """First 2 chars of the point_id → shard directory name.
+
+    UUID hex chars are ``[0-9a-f]``, giving 256 possible shards. Enough
+    to keep each leaf below ~50 files at 10k memories without requiring
+    a rebalance as the corpus grows.
+    """
+
+
+    s = re.sub(r"[^a-z0-9]", "", point_id.lower())
+    return (s[:2] or "00")
+
+
+def path_for(point_id: str) -> Path:
+    """Full .md path for a memory id (does NOT check existence).
+
+    Sanitises ``point_id`` so it can never traverse outside the atoms
+    directory — only alphanumerics, hyphens, and underscores are kept
+    (UUID4 ids never contain anything else).
+    """
+    safe_id = re.sub(r"[^a-zA-Z0-9\-]", "_", point_id)[:128]
+    return _atoms_dir() / _shard_for(safe_id) / f"mem_{safe_id}.md"
+
+
+_FRONTMATTER_DELIM = "---"
+
+
+def _split_frontmatter(raw: str) -> tuple[dict, str]:
+    """Parse a raw .md file into (frontmatter_dict, body_text).
+
+    A file missing the opening ``---`` is treated as all-body with empty
+    frontmatter, so hand-written memories without frontmatter still load.
+    """
+    if not raw.startswith(_FRONTMATTER_DELIM):
+        return {}, raw
+
+    parts = raw.split("\n" + _FRONTMATTER_DELIM + "\n", 1)
+    if len(parts) != 2:
+
+        return {}, raw
+    head, body = parts
+
+    fm_text = head[len(_FRONTMATTER_DELIM):].lstrip("\n")
+    try:
+        meta = yaml.safe_load(fm_text) or {}
+    except yaml.YAMLError as e:
+        _log.warning(f"invalid frontmatter YAML, treating as empty: {e}")
+        meta = {}
+    if not isinstance(meta, dict):
+
+        meta = {}
+    return meta, body.lstrip("\n")
+
+
+def _serialize(frontmatter: dict, body: str) -> str:
+    """Assemble frontmatter + body into a .md file's text form."""
+    fm_text = yaml.safe_dump(
+        frontmatter,
+        sort_keys=False,
+        allow_unicode=True,
+        default_flow_style=False,
+    ).rstrip()
+
+    body = body.rstrip() + "\n"
+    return f"{_FRONTMATTER_DELIM}\n{fm_text}\n{_FRONTMATTER_DELIM}\n\n{body}"
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def write(point_id: str, text: str, tag: str = "general",
+          thread_id: str | None = None, meta: dict | None = None,
+          created_iso: str | None = None) -> Path:
+    """Create or overwrite the .md file for ``point_id``.
+
+    Idempotent: if a file already exists we merge its frontmatter with
+    the new one, keeping any Phase-2+ fields the caller didn't know
+    about (salience, anchor, connections, …). Body always overwrites.
+    """
+    p = path_for(point_id)
+    p.parent.mkdir(parents=True, exist_ok=True)
+
+    existing_meta: dict = {}
+    if p.exists():
+        try:
+            existing_meta, _ = _split_frontmatter(p.read_text(encoding="utf-8"))
+        except Exception as e:
+            _log.debug(f"couldn't read existing {p} for merge: {e}")
+
+    frontmatter = {
+        **existing_meta,
+        "id": point_id,
+        "type": "atom",
+        "tag": tag,
+        "created": existing_meta.get("created") or created_iso or _now_iso(),
+        "updated": _now_iso(),
+    }
+    if thread_id:
+        frontmatter["thread_id"] = thread_id
+
+    if meta:
+
+
+        frontmatter["meta"] = {**(existing_meta.get("meta") or {}), **meta}
+
+    p.write_text(_serialize(frontmatter, text), encoding="utf-8")
+    return p
+
+
+def read(point_id: str) -> dict | None:
+    """Load a memory by id. Returns ``None`` if no file exists."""
+    p = path_for(point_id)
+    if not p.exists():
+        return None
+    try:
+        raw = p.read_text(encoding="utf-8")
+    except Exception as e:
+        _log.warning(f"read failed for {p}: {e}")
+        return None
+    fm, body = _split_frontmatter(raw)
+    return {
+        "id": fm.get("id") or point_id,
+        "type": fm.get("type") or "atom",
+        "tag": fm.get("tag") or "general",
+        "thread_id": fm.get("thread_id"),
+        "created": fm.get("created"),
+        "updated": fm.get("updated"),
+        "meta": fm.get("meta") or {},
+
+
+        "text": body.rstrip("\n"),
+        "_raw_frontmatter": fm,
+        "_path": str(p),
+    }
+
+
+def delete(point_id: str) -> bool:
+    """Remove the .md file. Returns True on success, False if missing or error."""
+    p = path_for(point_id)
+    if not p.exists():
+        return False
+    try:
+        p.unlink()
+    except Exception as e:
+        _log.warning(f"delete failed for {p}: {e}")
+        return False
+
+    try:
+        if not any(p.parent.iterdir()):
+            p.parent.rmdir()
+    except Exception:
+        pass
+    return True
+
+
+def iter_all() -> list[str]:
+    """List every point_id that has a markdown file. Used by migration +
+    consistency checks. Sorted for deterministic test output."""
+    root = _atoms_dir()
+    if not root.exists():
+        return []
+    ids: list[str] = []
+    pattern = re.compile(r"^mem_(.+)\.md$")
+    for shard in sorted(root.iterdir()):
+        if not shard.is_dir():
+            continue
+        for f in sorted(shard.iterdir()):
+            m = pattern.match(f.name)
+            if m:
+                ids.append(m.group(1))
+    return ids
+
+
+def memories_dir_str() -> str:
+    """Return str path of the memories root — used by integrity blocks
+    in tools.py to gate write_file against the whole subtree."""
+    return str(memories_root().resolve())

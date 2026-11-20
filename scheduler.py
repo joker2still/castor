@@ -1,0 +1,1325 @@
+"""Scheduler — cron-like task runner with SQLite storage."""
+
+import threading
+import time
+import json
+import re
+from datetime import datetime, timezone, timedelta
+import db
+import config
+import providers
+import logger
+
+_log = logger.get("scheduler")
+
+
+def _tz():
+    """Resolve the scheduler timezone.
+
+    Preference order:
+      1. ``config.get("tz_name")`` — an IANA zone like ``"Europe/Moscow"`` or
+         ``"America/New_York"`` — resolved via ``zoneinfo``. Honours DST so a
+         ``daily HH:MM`` task fires at the wall clock the user expects across
+         transitions.
+      2. Fallback: a fixed offset from ``config.TZ_OFFSET`` (the legacy
+         behaviour). Fixed offsets do not track DST and will drift ±1h
+         across transitions — acceptable if the user's locale doesn't have
+         DST or no ``tz_name`` is configured.
+    """
+    try:
+        tz_name = (config.get("tz_name") or "").strip()
+    except Exception:
+        tz_name = ""
+    if tz_name:
+        try:
+            from zoneinfo import ZoneInfo
+            return ZoneInfo(tz_name)
+        except Exception as e:
+            _log.warning(f"invalid tz_name={tz_name!r} ({e}); falling back to fixed offset")
+    return timezone(timedelta(hours=config.TZ_OFFSET))
+
+_thread_started = False
+_callbacks = []
+HEARTBEAT_TASK_NAME = "__heartbeat__"
+SYNTHESIS_TASK_NAME = "__synthesis__"
+SYNTHESIS_CONTINUOUS_TASK_NAME = "__synthesis_continuous__"
+COACH_TASK_NAME = "__coach_daily__"
+TRAJECTORY_PRUNE_TASK_NAME = "__trajectory_prune__"
+
+
+def _ensure_table():
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS scheduled_tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            task TEXT NOT NULL,
+            schedule TEXT NOT NULL,
+            next_run REAL NOT NULL,
+            last_run REAL,
+            repeat INTEGER DEFAULT 0,
+            enabled INTEGER DEFAULT 1,
+            run_count INTEGER DEFAULT 0,
+            last_status TEXT,
+            last_error TEXT,
+            last_duration_ms INTEGER,
+            last_result TEXT,
+            thread_id TEXT
+        )
+    """)
+
+
+def add(name: str, task: str, schedule: str, skip_dry_run: bool = False) -> dict:
+    """Add a scheduled task with automatic dry-run validation.
+
+    Schedule formats:
+      "in 5m"       — run once in 5 minutes
+      "in 2h"       — run once in 2 hours
+      "every 30m"   — repeat every 30 minutes
+      "every 2h"    — repeat every 2 hours
+      "daily 09:00" — every day at 09:00
+      "HH:MM"       — once today/tomorrow at that time
+
+    Pre-validation: executes the task once (with real side effects!) before
+    saving. If execution fails, the task is NOT saved and an error with
+    hints is returned so the model can retry with a corrected task description.
+    Note: for send/notify tasks, the pre-validation WILL send a real message.
+    """
+    _ensure_table()
+
+    next_run, repeat = _parse_schedule(schedule)
+    if next_run is None:
+        return {"error": f"Can't parse schedule: '{schedule}'"}
+
+
+    if not skip_dry_run:
+        _log.info(f"dry-run for '{name}': {task[:100]}")
+        import config as _cfg
+        _dry_exec = _dry_run_executor if _cfg.get("routine_dry_run_mock") else None
+        dry_result = _execute_task(task, max_rounds=8, tool_executor=_dry_exec)
+        validation = _validate_dry_run(dry_result, task)
+        if not validation["ok"]:
+            _log.warning(f"dry-run failed for '{name}': {validation['reason']}")
+            return {
+                "error": f"Dry-run failed: {validation['reason']}",
+                "output": dry_result[:500],
+                "hint": validation.get("hint", ""),
+
+
+                "offer_skip": True,
+                "saved": False,
+            }
+        _log.info(f"dry-run passed for '{name}': {dry_result[:100]}")
+
+
+    routine_thread_id: str | None = None
+    if _is_routine(task):
+        try:
+            import threads
+            t = threads.create(f"Routine · {name}", meta={
+                "kind": "routine",
+                "routine_name": name,
+                "schedule": schedule,
+                "created_at": time.time(),
+            }, source="scheduler")
+            routine_thread_id = t["id"]
+        except Exception as e:
+            _log.warning(f"failed to create routine thread for '{name}': {e}")
+
+    db.execute(
+        "INSERT INTO scheduled_tasks "
+        "(name, task, schedule, next_run, repeat, enabled, thread_id) "
+        "VALUES (?,?,?,?,?,1,?)",
+        (name, task, schedule, next_run, 1 if repeat else 0, routine_thread_id)
+    )
+
+    dt = datetime.fromtimestamp(next_run, _tz()).strftime("%H:%M:%S")
+    result = {"ok": True, "name": name, "next_run": dt, "repeat": bool(repeat)}
+    if routine_thread_id:
+        result["thread_id"] = routine_thread_id
+    if not skip_dry_run:
+        result["dry_run"] = "passed"
+        result["preview"] = dry_result[:200]
+    return result
+
+
+def _looks_like_error(result: str) -> bool:
+    """Heuristic: does a task result look like a failure?
+
+    Used to classify live runs as ok/err for UI stats. A stricter version
+    (``_validate_dry_run``) runs on pre-save validation; this one just
+    flags obvious error text so users don't see every run as "ok" when
+    the task actually crashed.
+    """
+    if not result:
+        return False
+    low = result.lower()
+    for marker in _DRY_RUN_ERROR_MARKERS:
+        if marker in low:
+            return True
+    if _DRY_RUN_ERROR_PATTERNS.search(result):
+        return True
+    return False
+
+
+_DRY_RUN_ERROR_MARKERS = [
+    "command not found", "no such file or directory", "permission denied",
+    "blocked:", "not allowed", "traceback (most recent call last)",
+    "modulenotfounderror",
+    "connection refused", "name or service not known",
+    "\nerrno ", "importerror:",
+]
+
+
+_DRY_RUN_ERROR_PATTERNS = re.compile(
+    r"^[ \t]*(?:error:|http error:|fatal:|exception:)", re.IGNORECASE | re.MULTILINE
+)
+
+
+def _validate_dry_run(result: str, task_description: str) -> dict:
+    """Check whether a dry-run (pre-validation execution) succeeded.
+
+    Note: this is a real execution with side effects, not a sandboxed
+    dry-run. The task runs through the full LLM tool-call loop.
+    """
+    if not result or not result.strip():
+        return {"ok": False, "reason": "Empty output",
+                "hint": "Task produced no output — check if commands exist and paths are correct"}
+
+    lower = result.lower()
+    for marker in _DRY_RUN_ERROR_MARKERS:
+        if marker in lower:
+            return {"ok": False, "reason": f"Output contains error: '{marker}'",
+                    "hint": "Try using built-in tools (http_request, read_file, shell) instead of external scripts"}
+    if _DRY_RUN_ERROR_PATTERNS.search(result):
+        match = _DRY_RUN_ERROR_PATTERNS.search(result).group().strip()
+        return {"ok": False, "reason": f"Output contains error pattern: '{match}'",
+                "hint": "Try using built-in tools (http_request, read_file, shell) instead of external scripts"}
+
+
+    task_lower = task_description.lower()
+    if any(w in task_lower for w in ("telegram", "send", "notify", "webhook",
+                                      "отправ", "уведом", "пришли", "пиши", "напиши")):
+        confirmations_en = ("ok", "sent", "200", "delivered", "posted", "message_id",
+                            "ok=true", "success", "done")
+        confirmations_ru = ("отправил", "отправлено", "отправлена", "послал", "послано",
+                            "доставлено", "успешно", "готово", "сделано")
+        ok_markers = confirmations_en + confirmations_ru
+        if not any(m in lower for m in ok_markers):
+            return {"ok": False, "reason": "Send task didn't confirm delivery",
+                    "hint": "Use http_request or the telegram tool directly, and make sure "
+                            "the final reply mentions the send succeeded."}
+
+    return {"ok": True}
+
+
+_DOW = {
+    "mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6,
+
+    "пн": 0, "вт": 1, "ср": 2, "чт": 3, "пт": 4, "сб": 5, "вс": 6,
+}
+_DOW_ALIASES = {
+    "weekdays": "mon,tue,wed,thu,fri",
+    "weekends": "sat,sun",
+    "будни": "mon,tue,wed,thu,fri",
+    "выходные": "sat,sun",
+}
+
+
+def _next_weekly_run(days: list[int], h: int, mi: int, now: float) -> float:
+    """Given a set of weekdays (0=Mon..6=Sun) and HH:MM, return the next
+    fire timestamp >= now. Repeat interval for weekly is always 1 week
+    (604800s) — the loop finds the next matching day each time."""
+    nowdt = datetime.fromtimestamp(now, _tz())
+    today_wd = nowdt.weekday()
+    for offset in range(8):
+        candidate_wd = (today_wd + offset) % 7
+        if candidate_wd not in days:
+            continue
+        candidate = nowdt.replace(hour=h, minute=mi, second=0, microsecond=0) + \
+                    timedelta(days=offset)
+        if candidate.timestamp() > now:
+            return candidate.timestamp()
+
+    return now + 7 * 86400
+
+
+def _parse_schedule(schedule: str) -> tuple:
+    """Parse schedule string → (next_run_timestamp, repeat_seconds_or_0).
+
+    Supported grammar:
+      in 5m / in 2h / in 30s            — one-off, relative
+      every 30m / every 2h              — repeat every N units
+      every 2 days 09:00                — every N days at that time
+      daily HH:MM                       — every day at HH:MM
+      weekdays HH:MM / weekends HH:MM   — Mon-Fri / Sat-Sun at HH:MM
+      mon HH:MM                         — every Monday at HH:MM (short
+                                          names: mon tue wed thu fri sat sun)
+      mon,wed,fri HH:MM                 — any subset, comma-separated
+      HH:MM                             — one-off today/tomorrow at that time
+    """
+    now = time.time()
+    s = schedule.strip().lower()
+
+
+    m = re.match(r"in\s+(\d+)\s*(s|m|h)", s)
+    if m:
+        val, unit = int(m.group(1)), m.group(2)
+        secs = val * {"s": 1, "m": 60, "h": 3600}[unit]
+        return (now + secs, 0)
+
+
+    m = re.match(r"every\s+(\d+)\s+days?\s+(\d{1,2}):(\d{2})$", s)
+    if m:
+        n, h, mi = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        today = datetime.now(_tz()).replace(hour=h, minute=mi, second=0, microsecond=0)
+        ts = today.timestamp()
+        if ts <= now:
+            ts += n * 86400
+        return (ts, n * 86400)
+
+
+    m = re.match(r"every\s+(\d+)\s*(s|m|h)$", s)
+    if m:
+        val, unit = int(m.group(1)), m.group(2)
+        secs = val * {"s": 1, "m": 60, "h": 3600}[unit]
+        return (now + secs, secs)
+
+
+    m = re.match(r"daily\s+(\d{1,2}):(\d{2})$", s)
+    if m:
+        h, mi = int(m.group(1)), int(m.group(2))
+        today = datetime.now(_tz()).replace(hour=h, minute=mi, second=0, microsecond=0)
+        ts = today.timestamp()
+        if ts <= now:
+            ts += 86400
+        return (ts, 86400)
+
+
+    m = re.match(r"([a-z,а-яё]{1,50})\s+(\d{1,2}):(\d{2})$", s)
+    if m:
+        days_spec = _DOW_ALIASES.get(m.group(1), m.group(1))
+        h, mi = int(m.group(2)), int(m.group(3))
+        day_tokens = [d.strip() for d in days_spec.split(",") if d.strip()]
+        if day_tokens and all(tok in _DOW for tok in day_tokens):
+            days = sorted({_DOW[tok] for tok in day_tokens})
+            ts = _next_weekly_run(days, h, mi, now)
+
+
+            return (ts, 7 * 86400)
+
+
+    m = re.match(r"(\d{1,2}):(\d{2})$", s)
+    if m:
+        h, mi = int(m.group(1)), int(m.group(2))
+        today = datetime.now(_tz()).replace(hour=h, minute=mi, second=0, microsecond=0)
+        ts = today.timestamp()
+        if ts <= now:
+            ts += 86400
+        return (ts, 0)
+
+    return (None, 0)
+
+
+def list_tasks() -> list[dict]:
+    _ensure_table()
+    rows = db.fetchall(
+        "SELECT id, name, task, schedule, next_run, last_run, repeat, enabled, "
+        "       run_count, last_status, last_error, last_duration_ms, last_result, "
+        "       thread_id "
+        "FROM scheduled_tasks ORDER BY next_run"
+    )
+    tasks = []
+    for (id_, name, task, schedule, next_run, last_run, repeat, enabled,
+         run_count, last_status, last_error, last_duration_ms, last_result,
+         thread_id) in rows:
+        next_dt = datetime.fromtimestamp(next_run, _tz()).strftime("%Y-%m-%d %H:%M")
+        last_dt = (datetime.fromtimestamp(last_run, _tz()).strftime("%Y-%m-%d %H:%M")
+                    if last_run else "")
+
+        if last_status == "ok":
+            last = f"ok · {last_duration_ms}ms" if last_duration_ms else "ok"
+        elif last_status == "err":
+            err_short = (last_error or "failed").split("\n", 1)[0][:60]
+            last = f"err · {err_short}"
+        else:
+            last = ""
+
+
+        recent = count_recent_runs_by_status(id_, limit=20) if id_ else {"counts": {}, "series": []}
+
+        tasks.append({
+            "id": id_, "name": name, "task": task, "schedule": schedule,
+            "next_run": next_dt, "last_run": last_dt,
+            "repeat": bool(repeat), "enabled": bool(enabled),
+            "run_count": int(run_count or 0),
+            "last_status": last_status or "",
+            "last": last,
+            "last_error": last_error or "",
+            "last_duration_ms": int(last_duration_ms or 0),
+            "last_result": (last_result or "")[:200],
+
+
+            "thread_id": thread_id or "",
+
+
+            "firing": is_routine_firing(thread_id) if thread_id else False,
+
+
+            "recent": recent,
+        })
+    return tasks
+
+
+def remove(task_id: int) -> str:
+    _ensure_table()
+    row = db.fetchone("SELECT name, thread_id FROM scheduled_tasks WHERE id=?",
+                       (task_id,))
+    if not row:
+        return f"✗ Task #{task_id} not found"
+    name, thread_id = row
+    if name == HEARTBEAT_TASK_NAME:
+        return f"✗ Heartbeat task cannot be removed. Use settings to disable it."
+    db.execute("DELETE FROM scheduled_tasks WHERE id=?", (task_id,))
+
+
+    if thread_id:
+        try:
+            import threads as _threads
+            _threads.delete(thread_id)
+        except Exception as e:
+            _log.debug(f"thread delete failed for routine {task_id}: {e}")
+    return f"✓ Task #{task_id} removed"
+
+
+def set_enabled(task_id: int, enabled: bool | None = None) -> dict:
+    """Pause or resume a routine.
+
+    ``enabled=None`` toggles; otherwise sets explicitly. System tasks
+    (heartbeat, synthesis) can be paused too — users pause heartbeat
+    via the Heartbeat settings tab, and ``set_enabled`` is the same
+    path.
+
+    Returns ``{"ok": True, "enabled": <new state>}`` or
+    ``{"error": "..."}`` on missing id.
+    """
+    _ensure_table()
+    row = db.fetchone(
+        "SELECT enabled FROM scheduled_tasks WHERE id=?", (task_id,),
+    )
+    if not row:
+        return {"error": f"task {task_id} not found"}
+    current = bool(row[0])
+    new_state = (not current) if enabled is None else bool(enabled)
+    db.execute(
+        "UPDATE scheduled_tasks SET enabled=? WHERE id=?",
+        (1 if new_state else 0, task_id),
+    )
+    _log.info(f"routine #{task_id}: enabled {current} → {new_state}")
+    return {"ok": True, "enabled": new_state}
+
+
+def remove_by_thread(thread_id: str) -> int:
+    """Reverse-link cleanup: when a thread is deleted directly, the
+    routine pointing at it must also go — otherwise the next tick fires
+    into a dead thread. Called from ``threads.delete``.
+
+    Returns the number of routines removed. Safely handles legacy rows
+    that predate migration 004 (thread_id column) — they're just skipped.
+    """
+    _ensure_table()
+    rows = db.fetchall(
+        "SELECT id, name FROM scheduled_tasks WHERE thread_id=?",
+        (thread_id,),
+    )
+    removed = 0
+    for rid, name in rows:
+        if name in (HEARTBEAT_TASK_NAME, SYNTHESIS_TASK_NAME,
+                    SYNTHESIS_CONTINUOUS_TASK_NAME, COACH_TASK_NAME,
+                    TRAJECTORY_PRUNE_TASK_NAME):
+            continue
+        db.execute("DELETE FROM scheduled_tasks WHERE id=?", (rid,))
+        _log.info(f"routine #{rid} '{name}' removed: its thread {thread_id} was deleted")
+        removed += 1
+    return removed
+
+
+def on_complete(fn):
+    """Register callback for task completion: fn(name, task, result)."""
+    _callbacks.append(fn)
+
+
+def _register_heartbeat():
+    """Auto-register heartbeat cron task if enabled and not already registered."""
+    val = db.kv_get("heartbeat:enabled")
+    if val == "0":
+        return
+    _ensure_table()
+    row = db.fetchone(
+        "SELECT id FROM scheduled_tasks WHERE name=?", (HEARTBEAT_TASK_NAME,)
+    )
+    if row:
+        return
+    interval = config.get("heartbeat_interval_min")
+    schedule = f"every {interval}m"
+    next_run = time.time() + interval * 60
+    _sys_cap = config.get("system_task_budget_usd")
+    db.execute(
+        "INSERT INTO scheduled_tasks (name, task, schedule, next_run, repeat, enabled, budget_usd_cap, budget_period_sec) "
+        "VALUES (?,?,?,?,1,1,?,86400)",
+        (HEARTBEAT_TASK_NAME, HEARTBEAT_TASK_NAME, schedule, next_run,
+         _sys_cap if _sys_cap else None)
+    )
+    _log.info(f"heartbeat registered: every {interval}m")
+
+
+def _unregister_heartbeat():
+    """Remove heartbeat task from scheduler."""
+    _ensure_table()
+    db.execute("DELETE FROM scheduled_tasks WHERE name=?", (HEARTBEAT_TASK_NAME,))
+    _log.info("heartbeat unregistered")
+
+
+def _execute_heartbeat() -> str:
+    """Execute heartbeat: run checklist items through agent."""
+    raw = db.kv_get("heartbeat:items")
+    if not raw:
+        return "HEARTBEAT_OK"
+    try:
+        items = json.loads(raw)
+    except json.JSONDecodeError:
+        return "HEARTBEAT_OK"
+    if not items:
+        return "HEARTBEAT_OK"
+
+    import agent
+    prompt = (
+        "Here are your periodic tasks:\n"
+        + "\n".join(f"- {item}" for item in items)
+        + "\n\nCheck what's relevant now. If nothing needs attention, reply HEARTBEAT_OK."
+    )
+    try:
+        result = agent.run(prompt, thread_id=None, source="heartbeat")
+        return result.reply
+    except Exception as e:
+        _log.error(f"heartbeat agent error: {e}")
+        return f"Error: {e}"
+
+
+def _register_synthesis():
+    """Auto-register night synthesis cron if enabled."""
+    if not config.get("synthesis_enabled"):
+        return
+    _ensure_table()
+    row = db.fetchone(
+        "SELECT id FROM scheduled_tasks WHERE name=?", (SYNTHESIS_TASK_NAME,)
+    )
+    if row:
+        return
+    synthesis_time = config.get("synthesis_time")
+    schedule = f"daily {synthesis_time}"
+
+    h, m = map(int, synthesis_time.split(":"))
+    now = datetime.now(_tz())
+    target = now.replace(hour=h, minute=m, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    next_run = target.timestamp()
+    _sys_cap = config.get("system_task_budget_usd")
+    db.execute(
+        "INSERT INTO scheduled_tasks (name, task, schedule, next_run, repeat, enabled, budget_usd_cap, budget_period_sec) "
+        "VALUES (?,?,?,?,1,1,?,86400)",
+        (SYNTHESIS_TASK_NAME, SYNTHESIS_TASK_NAME, schedule, next_run,
+         _sys_cap if _sys_cap else None)
+    )
+    _log.info(f"synthesis registered: {schedule}")
+
+
+def _register_synthesis_continuous():
+    """Auto-register the continuous-trickle synthesis cron if enabled.
+
+    Fires every ``synthesis_continuous_interval_min`` minutes (default 15)
+    with a small batch (``synthesis_continuous_max_per_run``, default 5).
+    The nightly batch (``__synthesis__``) keeps running as a catch-up for
+    anything the trickle misses or backlogs.
+
+    Idempotent — re-registering at startup updates the schedule if the
+    interval changed, no duplicate row is created.
+    """
+    if not config.get("synthesis_enabled"):
+        return
+    if not config.get("synthesis_continuous_enabled"):
+        return
+    _ensure_table()
+    interval = max(1, int(config.get("synthesis_continuous_interval_min") or 15))
+    schedule = f"every {interval}m"
+    next_run = time.time() + interval * 60
+    _sys_cap = config.get("system_task_budget_usd")
+
+    row = db.fetchone(
+        "SELECT id, schedule FROM scheduled_tasks WHERE name=?",
+        (SYNTHESIS_CONTINUOUS_TASK_NAME,)
+    )
+    if row:
+
+
+        if row[1] != schedule:
+            db.execute(
+                "UPDATE scheduled_tasks SET schedule=?, next_run=? WHERE id=?",
+                (schedule, next_run, row[0])
+            )
+            _log.info(f"continuous synthesis schedule updated: {schedule}")
+        return
+    db.execute(
+        "INSERT INTO scheduled_tasks (name, task, schedule, next_run, repeat, enabled, budget_usd_cap, budget_period_sec) "
+        "VALUES (?,?,?,?,1,1,?,86400)",
+        (SYNTHESIS_CONTINUOUS_TASK_NAME, SYNTHESIS_CONTINUOUS_TASK_NAME,
+         schedule, next_run, _sys_cap if _sys_cap else None)
+    )
+    _log.info(f"continuous synthesis registered: {schedule}")
+
+
+def _stamp_system_task_budgets():
+    """One-time migration: stamp existing system tasks with budget caps."""
+    if db.kv_get("_system_task_budgets_stamped"):
+        return
+    _sys_cap = config.get("system_task_budget_usd")
+    if _sys_cap:
+        for name in (HEARTBEAT_TASK_NAME, SYNTHESIS_TASK_NAME,
+                     SYNTHESIS_CONTINUOUS_TASK_NAME, COACH_TASK_NAME):
+            db.execute(
+                "UPDATE scheduled_tasks SET budget_usd_cap=?, budget_period_sec=86400 "
+                "WHERE name=? AND budget_usd_cap IS NULL",
+                (_sys_cap, name),
+            )
+    db.kv_set("_system_task_budgets_stamped", "1")
+
+
+def _register_trajectory_prune():
+    """Auto-register a daily trajectory rotation if trajectory recording
+    is enabled.
+
+    Trajectory files at ``~/.castor/trajectories/*.jsonl`` accumulate per
+    run (chat turns, subagent dispatches, etc.). The
+    ``trajectory_keep_days`` setting documents a default 30-day window
+    but until v0.23.4 nothing actually called ``trajectory.prune_old`` —
+    files grew unbounded. This task closes the gap: a stateless system
+    job at 04:00 daily that removes ``*.jsonl`` whose mtime is older
+    than the configured window.
+
+    Skipped when trajectory recording is OFF — no files, nothing to
+    prune. Idempotent: re-registering at startup updates the cadence
+    string but never creates a duplicate row.
+    """
+    if not config.get("trajectory_enabled"):
+        return
+    _ensure_table()
+    schedule = "daily 04:00"
+    next_run = time.time() + 3600
+    row = db.fetchone(
+        "SELECT id, schedule FROM scheduled_tasks WHERE name=?",
+        (TRAJECTORY_PRUNE_TASK_NAME,),
+    )
+    if row:
+        if row[1] != schedule:
+            db.execute(
+                "UPDATE scheduled_tasks SET schedule=?, next_run=? WHERE id=?",
+                (schedule, next_run, row[0]),
+            )
+            _log.info(f"trajectory prune schedule updated: {schedule}")
+        return
+    db.execute(
+        "INSERT INTO scheduled_tasks (name, task, schedule, next_run, repeat, enabled) "
+        "VALUES (?,?,?,?,1,1)",
+        (TRAJECTORY_PRUNE_TASK_NAME, TRAJECTORY_PRUNE_TASK_NAME,
+         schedule, next_run),
+    )
+    _log.info(f"trajectory prune registered: {schedule}")
+
+
+def _register_coach():
+    """Auto-register the daily anti-pattern coach if enabled.
+
+    Inspired by Microsoft's AI Engineer Coach: scans recent agent_runs
+    / goals for known degenerate shapes (mega sessions, cost outliers,
+    capitulating goals, runaway synthesis, etc.) and saves a concise
+    markdown summary to ``memory`` so recall surfaces it on the user's
+    next turn. Pure-Python detection, no LLM cost.
+
+    Opt-in via ``setting:coach_enabled`` (default 0). Idempotent —
+    re-running at startup updates the schedule if the cadence changes;
+    no duplicate row.
+    """
+    if not config.get("coach_enabled"):
+        return
+    _ensure_table()
+    schedule = "daily 09:00"
+
+
+    next_run = time.time() + 3600
+    row = db.fetchone(
+        "SELECT id, schedule FROM scheduled_tasks WHERE name=?",
+        (COACH_TASK_NAME,),
+    )
+    if row:
+        if row[1] != schedule:
+            db.execute(
+                "UPDATE scheduled_tasks SET schedule=?, next_run=? WHERE id=?",
+                (schedule, next_run, row[0]),
+            )
+            _log.info(f"coach schedule updated: {schedule}")
+        return
+    db.execute(
+        "INSERT INTO scheduled_tasks (name, task, schedule, next_run, repeat, enabled) "
+        "VALUES (?,?,?,?,1,1)",
+        (COACH_TASK_NAME, COACH_TASK_NAME, schedule, next_run),
+    )
+    _log.info(f"coach registered: {schedule}")
+
+
+def start():
+    """Start the scheduler background thread."""
+    global _thread_started
+    if _thread_started:
+        return
+    _thread_started = True
+    _register_heartbeat()
+    _register_synthesis()
+    _register_synthesis_continuous()
+    _register_coach()
+    _register_trajectory_prune()
+    _stamp_system_task_budgets()
+    t = threading.Thread(target=_loop, daemon=True)
+    t.start()
+
+
+def _loop():
+    """Main scheduler loop — checks every 30 seconds."""
+
+
+    time.sleep(15)
+
+
+    try:
+        n = detect_missed_runs()
+        if n:
+            _log.info(f"scheduler startup: logged {n} missed fires across routines")
+    except Exception:
+        _log.error("detect_missed_runs failed", exc_info=True)
+    while True:
+        try:
+            _check_and_run()
+
+
+            db.kv_set("scheduler:last_check", str(time.time()))
+        except Exception:
+            _log.error("scheduler loop error", exc_info=True)
+        time.sleep(30)
+
+
+def _check_and_run():
+    """Check for due tasks and execute them."""
+    _ensure_table()
+    now = time.time()
+
+    rows = db.fetchall(
+        "SELECT id, name, task, schedule, next_run, repeat, thread_id FROM scheduled_tasks "
+        "WHERE enabled=1 AND next_run<=?",
+        (now,)
+    )
+
+    for id_, name, task, schedule, scheduled_at, repeat, thread_id in rows:
+
+        if repeat:
+
+
+            next_run, interval = _parse_schedule(schedule)
+            if next_run is None:
+
+
+                next_run = now + 3600
+            db.execute(
+                "UPDATE scheduled_tasks SET next_run=? WHERE id=?",
+                (next_run, id_)
+            )
+        else:
+
+            db.execute("UPDATE scheduled_tasks SET enabled=0 WHERE id=?", (id_,))
+
+
+        _log.info(f"cron firing: #{id_} '{name}' → {task[:80]}")
+        t0 = time.time()
+        result = ""
+        error_msg = None
+        try:
+
+
+            if _is_routine(task):
+
+
+                if not thread_id:
+                    thread_id = _ensure_routine_thread(id_, name, schedule)
+                result = _execute_routine(task, name, id_, thread_id,
+                                            scheduled_at=scheduled_at)
+            else:
+                result = _execute_task(task)
+        except Exception as e:
+            error_msg = f"{type(e).__name__}: {e}"
+            _log.warning(f"cron crashed: #{id_} '{name}' → {error_msg}", exc_info=True)
+        duration_ms = int((time.time() - t0) * 1000)
+        _log.info(f"cron done: #{id_} '{name}' ({duration_ms}ms) → {result[:200]}")
+
+
+        status = "err" if (error_msg or _looks_like_error(result)) else "ok"
+        last_result_preview = (error_msg or result or "")[:500]
+
+
+        if status == "err" and repeat and id_:
+            try:
+                threshold = int(config.get("failure_alert_threshold") or 3)
+                rows = db.fetchall(
+                    "SELECT status FROM agent_runs WHERE cron_id=? "
+                    "ORDER BY started_at DESC LIMIT ?",
+                    (id_, threshold),
+                )
+                if len(rows) >= threshold and all(r[0] in ("err", "error") for r in rows):
+                    _log.error(
+                        "routine #%d '%s' has failed %d consecutive times. Last error: %s",
+                        id_, name, threshold, (error_msg or result[:200]),
+                    )
+            except Exception:
+                pass  # alerting must never crash the scheduler
+
+
+        for fn in _callbacks:
+            try:
+                fn(name, task, result)
+            except Exception:
+                _log.warning(f"cron callback error for #{id_}", exc_info=True)
+
+
+        if repeat:
+            if not _is_routine(task):
+                db.execute(
+                    "UPDATE scheduled_tasks "
+                    "SET last_run=?, run_count=COALESCE(run_count,0)+1, "
+                    "    last_status=?, last_error=?, last_duration_ms=?, last_result=? "
+                    "WHERE id=?",
+                    (now, status, error_msg, duration_ms, last_result_preview, id_),
+                )
+        else:
+            db.execute("DELETE FROM scheduled_tasks WHERE id=?", (id_,))
+
+
+def _is_routine(task_desc: str) -> bool:
+    """True if this is a user-created routine (runs through agent.run in a
+    dedicated thread), False for system tasks (heartbeat, synthesis) and
+    trivial reminders which keep the fast stateless path.
+
+    ``SYNTHESIS_CONTINUOUS_TASK_NAME`` is in the False-list as of v0.23.2.
+    Before that it returned True by default and the scheduler routed
+    every 15-min fire through ``agent.run`` on the user's main thread —
+    each fire loaded the full system prompt + thread history + tool
+    catalog + recall, turning a "process 5 new memory items" job into
+    a megacontext sweep that cost $0.06-$9.86 per fire instead of the
+    stateless-path's ~$0. One user accumulated $41.94 in a week from
+    ~680 fires with no awareness. The fast path at
+    ``_execute_task::SYNTHESIS_CONTINUOUS_TASK_NAME`` (which calls
+    ``synthesis.run_continuous()`` directly with no LLM) was dead code
+    for a year because ``_is_routine`` claimed control first.
+    """
+    if task_desc == HEARTBEAT_TASK_NAME:
+        return False
+    if task_desc == SYNTHESIS_TASK_NAME:
+        return False
+    if task_desc == SYNTHESIS_CONTINUOUS_TASK_NAME:
+        return False
+    if task_desc == COACH_TASK_NAME:
+        return False
+    if task_desc == TRAJECTORY_PRUNE_TASK_NAME:
+        return False
+    low = task_desc.lower()
+    reminder_markers = ("remind", "напомни", "напоминание", "напомнить",
+                        "выпить", "drink", "stretch", "break")
+    if any(m in low for m in reminder_markers) and len(task_desc) < 200:
+        return False
+    return True
+
+
+def _ensure_routine_thread(cron_id: int, routine_name: str, schedule: str) -> str:
+    """Back-fill a thread for a routine that predates migration 004.
+
+    Routines created before v0.17.30 were saved without a thread_id
+    column. On first post-migration firing we create one, stamp it
+    back, and return it. Empty string on failure → caller falls back
+    to agent.run's default active thread (ugly but non-fatal).
+    """
+    try:
+        import threads
+        t = threads.create(f"Routine · {routine_name}", meta={
+            "kind": "routine",
+            "routine_name": routine_name,
+            "schedule": schedule,
+            "backfilled": True,
+        }, source="scheduler")
+        tid = t["id"]
+        db.execute("UPDATE scheduled_tasks SET thread_id=? WHERE id=?",
+                   (tid, cron_id))
+        _log.info(f"back-filled thread_id for routine #{cron_id} '{routine_name}' → {tid}")
+        return tid
+    except Exception as e:
+        _log.warning(f"routine #{cron_id}: thread back-fill failed: {e}")
+        return ""
+
+
+_ROUTINE_FIRE_LOCKS: dict[str, threading.Lock] = {}
+_ROUTINE_FIRE_LOCKS_MUTEX = threading.Lock()
+
+
+def _get_fire_lock(thread_id: str) -> threading.Lock:
+    with _ROUTINE_FIRE_LOCKS_MUTEX:
+        lk = _ROUTINE_FIRE_LOCKS.get(thread_id)
+        if lk is None:
+            lk = threading.Lock()
+            _ROUTINE_FIRE_LOCKS[thread_id] = lk
+        return lk
+
+
+def _log_run(cron_id: int, *, scheduled_at: float, started_at: float | None,
+              finished_at: float | None, duration_ms: int | None,
+              status: str, error: str | None, result_preview: str,
+              thread_id: str) -> int | None:
+    """Write a run row to agent_runs. Returns the new id (or None on error).
+
+    After v0.19.0 this function is only called for 'missed' and 'skipped' rows;
+    ok/err rows are written by agent_loop's instrumentation with full token data.
+
+    status values:
+      ok / err — agent.run completed; err means exception or error marker
+      missed   — server was offline at the scheduled time; never executed
+      skipped  — per-thread fire lock held (concurrent fire in flight)
+    """
+    if status not in ("missed", "skipped"):
+
+
+        _log.debug(f"_log_run ignoring unexpected status {status!r} for #{cron_id}")
+        return None
+    try:
+        return db.insert_skipped_run(
+            cron_id=cron_id,
+            thread_id=thread_id or "",
+            scheduled_at=scheduled_at,
+            reason=status,
+        )
+    except Exception as e:
+        _log.debug(f"agent_runs insert failed for #{cron_id}: {e}")
+        return None
+
+
+def list_runs(cron_id: int, limit: int = 20) -> list[dict]:
+    """Recent runs for a routine, newest first. Reads from agent_runs."""
+    from datetime import datetime as _dt
+
+    def _fmt(ts: float | None) -> str:
+        return _dt.fromtimestamp(ts, _tz()).strftime("%Y-%m-%d %H:%M") if ts else ""
+
+    raw = db.get_runs_for_routine(cron_id, limit=limit)
+    out = []
+    for row in raw:
+        out.append({
+            "id": row["id"],
+            "scheduled_at": _fmt(row.get("scheduled_at")),
+            "started_at": _fmt(row.get("started_at")),
+            "finished_at": _fmt(row.get("finished_at")),
+            "duration_ms": int(row.get("duration_ms") or 0),
+            "status": row.get("status") or "",
+            "error": row.get("error") or "",
+            "result_preview": row.get("result_preview") or "",
+            "thread_id": row.get("thread_id") or "",
+        })
+    return out
+
+
+def count_recent_runs_by_status(cron_id: int, limit: int = 20) -> dict:
+    """Breakdown of the last ``limit`` runs by status — drives the UI dots."""
+    rows = db._get_conn().execute(
+        "SELECT status FROM agent_runs WHERE cron_id=? ORDER BY id DESC LIMIT ?",
+        (cron_id, limit),
+    ).fetchall()
+    counts = {"ok": 0, "err": 0, "missed": 0, "skipped": 0, "running": 0, "aborted": 0}
+    series = []
+    for (status,) in rows:
+        counts[status] = counts.get(status, 0) + 1
+        series.append(status)
+    return {"counts": counts, "series": list(reversed(series))}
+
+
+def _auto_resume_aborted_routines(now: float) -> None:
+    """Auto-resume routine agent_runs that were aborted within the configured
+    short-window TTL (default 5 min). Called at every detect_missed_runs()
+    invocation so crash-aborted routines are picked up promptly on next boot.
+
+    Gated on ``resume_routine_auto`` config flag (default True).
+    """
+    try:
+        if not config.get("resume_routine_auto"):
+            return
+        ttl = float(config.get("resume_ttl_routine_sec") or 300)
+    except Exception:
+        return
+    cutoff = now - ttl
+    try:
+        rows = db._get_conn().execute(
+            "SELECT id, cron_id FROM agent_runs "
+            "WHERE status='aborted' AND cron_id IS NOT NULL "
+            "  AND started_at >= ? AND dismissed_at IS NULL "
+            "  AND resumed_from_run_id IS NULL "
+            "  AND id NOT IN (SELECT resumed_from_run_id FROM agent_runs "
+            "                 WHERE resumed_from_run_id IS NOT NULL)",
+            (cutoff,),
+        ).fetchall()
+    except Exception as e:
+        _log.warning(f"routine auto-resume scan failed: {e}")
+        return
+    for (rid, cron_id) in rows:
+        _log.info(f"auto-resuming routine run #{rid} (cron {cron_id})")
+        try:
+            import agent as _agent_mod
+            _agent_mod.resume_interrupted_run(rid)
+        except Exception as e:
+            _log.warning(f"routine auto-resume failed for #{rid}: {e}")
+
+
+def detect_missed_runs() -> int:
+    """Scan for routines whose scheduled slot(s) lapsed while the server
+    was offline; insert agent_runs rows with status=missed so the
+    history reflects reality honestly.
+
+    Called once from the scheduler loop at startup. Uses a kv stamp
+    ``scheduler:last_check`` to bound the lookback — anything before
+    that we already processed in a previous boot.
+
+    Caps missed-insertions at 10 per routine so a long outage doesn't
+    create hundreds of rows the user has to scroll through.
+    """
+    try:
+        last_check = float(db.kv_get("scheduler:last_check") or 0)
+    except Exception:
+        last_check = 0
+    now = time.time()
+    if last_check == 0:
+
+
+        db.kv_set("scheduler:last_check", str(now))
+        _auto_resume_aborted_routines(now)
+        return 0
+
+
+    if now - last_check < 60:
+        db.kv_set("scheduler:last_check", str(now))
+        _auto_resume_aborted_routines(now)
+        return 0
+
+    _ensure_table()
+    rows = db.fetchall(
+        "SELECT id, name, task, schedule, next_run, repeat, enabled, thread_id "
+        "FROM scheduled_tasks WHERE enabled=1"
+    )
+    total_missed = 0
+    for (cron_id, name, task, schedule, next_run, repeat, enabled,
+         thread_id) in rows:
+        if not repeat:
+            continue
+        if not _is_routine(task):
+            continue
+
+        _, interval = _parse_schedule(schedule)
+        if not interval or interval <= 0:
+            continue
+
+
+        slot = next_run - interval
+        missed = 0
+        while slot > last_check and slot < now and missed < 10:
+            _log_run(
+                cron_id,
+                scheduled_at=slot,
+                started_at=None,
+                finished_at=None,
+                duration_ms=None,
+                status="missed",
+                error="server was offline at the scheduled time",
+                result_preview="",
+                thread_id=thread_id or "",
+            )
+            missed += 1
+            slot -= interval
+        if missed:
+            _log.info(f"routine #{cron_id} '{name}': {missed} missed fires logged")
+            total_missed += missed
+    db.kv_set("scheduler:last_check", str(now))
+    _auto_resume_aborted_routines(now)
+    return total_missed
+
+
+def _execute_routine(task_desc: str, routine_name: str, cron_id: int,
+                      thread_id: str, scheduled_at: float | None = None) -> str:
+    """Run a routine firing through agent.run inside its permanent thread.
+
+    Each firing appends a fresh user → assistant turn to ``thread_id``,
+    so the thread grows into a chat log of all past runs.
+
+    Held behind a per-thread lock — two concurrent fires would race over
+    the user/assistant writes. Second caller no-ops cleanly instead.
+
+    Writes:
+      - agent_runs row for 'skipped' (via _log_run); ok/err rows are written
+        by agent_loop.run_loop when ctx.cron_id is set
+      - scheduled_tasks metrics (last_run, run_count, last_status, ...)
+
+    ``scheduled_at`` lets the caller record when the run was *supposed*
+    to happen — for scheduler ticks it's the row's next_run before
+    rescheduling; for manual/auto fires it defaults to now.
+
+    Returns the reply text (empty string if another fire was in progress
+    and we chose to skip rather than queue).
+    """
+    import agent
+    from turn_context import TurnContext
+
+    sched_at = scheduled_at if scheduled_at is not None else time.time()
+    lock = _get_fire_lock(thread_id)
+
+
+    if not lock.acquire(blocking=False):
+        _log.info(f"routine #{cron_id} '{routine_name}': skipped (fire already in progress)")
+        if cron_id:
+            _log_run(
+                cron_id, scheduled_at=sched_at, started_at=time.time(),
+                finished_at=time.time(), duration_ms=0,
+                status="skipped",
+                error="another fire was already in progress on this thread",
+                result_preview="", thread_id=thread_id,
+            )
+        return ""
+
+
+    try:
+        budget = db.get_routine_budget(cron_id) if cron_id else None
+    except Exception as _budget_err:
+        _log.warning(f"routine #{cron_id}: budget lookup failed ({_budget_err}) — proceeding without cap")
+        budget = None
+    if budget:
+        try:
+            spent = db.get_routine_period_spend(cron_id, budget["period_sec"])
+        except Exception as _spend_err:
+            _log.warning(f"routine #{cron_id}: spend query failed ({_spend_err}) — proceeding without cap")
+            spent = 0
+        if spent >= budget["cap"]:
+            _log.warning(
+                f"routine #{cron_id}: budget cap ${budget['cap']:.4f} reached "
+                f"(${spent:.4f} spent in last {budget['period_sec']}s) — skipping fire"
+            )
+            try:
+                skip_id = db.insert_skipped_run(
+                    cron_id=cron_id, thread_id=thread_id or "",
+                    scheduled_at=sched_at, reason="skipped",
+                )
+
+                db._get_conn().execute(
+                    "UPDATE agent_runs SET error='budget_exceeded' WHERE id=?",
+                    (skip_id,),
+                )
+                db._get_conn().commit()
+            except Exception as _e:
+                _log.debug(f"budget-skip recording failed: {_e}")
+            lock.release()
+            return ""
+
+    t0 = time.time()
+    reply = ""
+    error_msg: str | None = None
+    try:
+
+
+        ctx = TurnContext(source="routine", cron_id=cron_id)
+        result = agent.run(task_desc, thread_id=thread_id, source="routine",
+                            ctx=ctx, save_user_msg=False)
+        reply = getattr(result, "reply", "") or ""
+    except Exception as e:
+        error_msg = f"{type(e).__name__}: {e}"
+        _log.warning(f"routine #{cron_id} '{routine_name}' crashed: {error_msg}",
+                     exc_info=True)
+    finally:
+        duration_ms = int((time.time() - t0) * 1000)
+        lock.release()
+
+    finished_at = time.time()
+    status = "err" if (error_msg or _looks_like_error(reply)) else "ok"
+    last_result_preview = (error_msg or reply or "")[:500]
+
+
+    if cron_id:
+        try:
+            db.execute(
+                "UPDATE scheduled_tasks "
+                "SET last_run=?, run_count=COALESCE(run_count,0)+1, "
+                "    last_status=?, last_error=?, last_duration_ms=?, last_result=? "
+                "WHERE id=?",
+                (finished_at, status, error_msg, duration_ms,
+                 last_result_preview, cron_id),
+            )
+        except Exception as e:
+            _log.debug(f"routine metrics update failed for #{cron_id}: {e}")
+    return reply
+
+
+def is_routine_firing(thread_id: str) -> bool:
+    """True if a fire is currently in progress for this routine's thread.
+
+    Used by the ``/run`` endpoint to tell the UI that clicking Run twice
+    is a no-op instead of letting users see a silent skip.
+    """
+    lock = _ROUTINE_FIRE_LOCKS.get(thread_id)
+    return bool(lock and lock.locked())
+
+
+_DRY_RUN_STUBBED_TOOLS = {"shell", "http_request", "send_file", "telegram_notify_owner"}
+
+
+def _dry_run_executor(name: str, args: dict) -> str:
+    """Wrapping executor that stubs dangerous tools during dry-run validation."""
+    if name in _DRY_RUN_STUBBED_TOOLS:
+        _log.info(f"dry-run stub: {name}({str(args)[:80]})")
+        return f"[DRY-RUN STUB] {name} would execute with args: {str(args)[:200]}"
+    import tools
+    return tools.execute(name, args)
+
+
+def _execute_task(task_desc: str, max_rounds: int = 10, tool_executor=None) -> str:
+    """Run a task through the LLM.
+
+    Args:
+        task_desc: task description or special name (e.g. __heartbeat__).
+        max_rounds: maximum tool call rounds (default 10, dry-run uses 5).
+        tool_executor: callable(name, args) -> str. Defaults to tools.execute.
+    """
+    import config
+    import tools
+
+    if tool_executor is None:
+        tool_executor = tools.execute
+
+
+    if task_desc == HEARTBEAT_TASK_NAME:
+        return _execute_heartbeat()
+
+
+    if task_desc == SYNTHESIS_TASK_NAME:
+        import synthesis
+        return synthesis.run_synthesis()
+
+
+    if task_desc == SYNTHESIS_CONTINUOUS_TASK_NAME:
+        import synthesis
+        return synthesis.run_continuous()
+
+
+    if task_desc == COACH_TASK_NAME:
+        import coach
+        return coach.run_pass()
+
+
+    if task_desc == TRAJECTORY_PRUNE_TASK_NAME:
+        import trajectory
+        days = int(config.get("trajectory_keep_days") or 30)
+        removed = trajectory.prune_old(days)
+        return f"trajectory prune: removed {removed} file(s) older than {days}d"
+
+
+    reminder_markers = ["remind", "напомни", "напоминание", "напомнить", "выпить", "drink", "stretch", "break"]
+    lower_task = task_desc.lower()
+    if any(m in lower_task for m in reminder_markers) and len(task_desc) < 200:
+        return f"🔔 Reminder: {task_desc}"
+
+    data_dir = str(config.DATA_DIR)
+    client = providers.get_client()
+
+
+    messages = [
+        {"role": "system", "content": (
+            "You are a scheduled task worker. Execute the task and return the result in ONE pass.\n"
+            "You will NOT be able to ask follow-up questions — make decisions and act.\n"
+            "\n"
+            "Known paths (use read_file DIRECTLY, don't shell-find first):\n"
+            f"  {data_dir}/logs/castor.log   — full INFO+ log\n"
+            f"  {data_dir}/logs/errors.log    — WARNING+ only (usually what you want for summaries)\n"
+            f"  {data_dir}/workspace/         — agent workspace (for writes)\n"
+            "\n"
+            "Tool selection cheat-sheet:\n"
+            "- Read a known file: use read_file(path). Do NOT use shell for this.\n"
+            "- Run shell commands ONLY when you need process output (ps, curl, git, etc).\n"
+            "- Send a Telegram message to the user: use telegram_notify_owner(text=<msg>).\n"
+            "  ONE call, no token or chat_id needed — the bot is already configured. This is\n"
+            "  the correct tool for 'send to telegram', 'notify me', 'пришли в телегу', etc.\n"
+            "  Do NOT use http_request for this — you'll waste rounds hunting for chat IDs.\n"
+            "- Need an extended tool (mcp, schedule, notes, etc)? Call tool_search('<keyword>')\n"
+            "  FIRST to unlock it, THEN call the tool. Don't guess tool names.\n"
+            "- Save a result for later runs: memory_save({text, tag:'cron-result'}).\n"
+            "\n"
+            "Final reply rules:\n"
+            "- If the task is a reminder ('remind me', 'напомни'): just return the reminder text.\n"
+            "- If the task sends/posts/notifies: the final reply MUST confirm delivery\n"
+            "  (e.g. 'Sent.', 'Отправлено.', 'message_id=42'). Dry-run validation checks for this.\n"
+            "- Keep the final reply under 200 words. Summarise, don't paste full logs back."
+        )},
+        {"role": "user", "content": task_desc},
+    ]
+
+    all_tools = tools.get_all_tools()
+    rounds = 0
+
+    while rounds < max_rounds:
+        try:
+            resp = client.chat.completions.create(
+                model=providers.get_model(),
+                messages=messages,
+                tools=all_tools,
+                tool_choice="auto",
+                temperature=0.5,
+
+
+                max_tokens=2048,
+            )
+        except Exception as e:
+            _log.error(f"cron LLM call failed: {e}", exc_info=True)
+            return f"Error: {e}"
+
+        msg = resp.choices[0].message
+
+        if msg.tool_calls:
+
+
+            from agent_loop import normalize_args_for_api
+            assistant_msg = {"role": "assistant", "content": msg.content or ""}
+            assistant_msg["tool_calls"] = [
+                {"id": tc.id, "type": "function",
+                 "function": {"name": tc.function.name,
+                              "arguments": normalize_args_for_api(tc.function.arguments)}}
+                for tc in msg.tool_calls
+            ]
+            messages.append(assistant_msg)
+
+            for tc in msg.tool_calls:
+                try:
+                    args = json.loads(tc.function.arguments)
+                except json.JSONDecodeError:
+                    args = {}
+                result = tool_executor(tc.function.name, args)
+                messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+            rounds += 1
+            continue
+
+        reply = re.sub(r"<think>.*?</think>\s*", "", msg.content or "", flags=re.DOTALL).strip()
+        return reply
+
+    return "Task completed (max rounds)"

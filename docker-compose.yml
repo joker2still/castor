@@ -1,0 +1,13 @@
+services:
+  castor:
+    image: ghcr.io/joker2still/castor:latest
+    # build: .
+    container_name: castor
+    ports:
+      - "7860:7860"
+    volumes:
+      - ./castor-data:/data
+    env_file:
+      - .env
+    restart: unless-stopped
+    shm_size: "1gb"

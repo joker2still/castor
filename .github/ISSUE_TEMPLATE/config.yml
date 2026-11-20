@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 💬 Question or support
+    url: https://github.com/joker2still/castor/discussions
+    about: Ask a question, share a workflow, or chat with other users. Issues are for bugs and feature requests only.
+  - name: 🔒 Security vulnerability
+    url: https://github.com/joker2still/castor/security/advisories/new
+    about: Report privately via GitHub Security Advisory — not a public issue. See SECURITY.md for scope.

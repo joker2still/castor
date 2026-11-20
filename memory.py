@@ -1,0 +1,1175 @@
+"""Qdrant-backed semantic memory — hybrid search (dense + sparse via FastEmbed), recommendations, grouping."""
+
+import atexit
+import os
+import uuid
+import time
+import threading
+from qdrant_client import QdrantClient
+from qdrant_client.models import (
+    VectorParams, Distance, PointStruct, Filter,
+    FieldCondition, MatchValue, Range, PayloadSchemaType,
+    SparseVectorParams, SparseVector,
+    Fusion, FusionQuery, Prefetch, Datatype, TextIndexParams,
+    TokenizerType,
+)
+import config
+import logger
+
+_log = logger.get("memory")
+
+_qclient: QdrantClient | None = None
+_dense_model = None
+_sparse_model = None
+
+
+_qclient_lock = threading.Lock()
+_dense_model_lock = threading.Lock()
+_sparse_model_lock = threading.Lock()
+
+
+from secret_scrub import scrub_text as _scrub_text_impl
+
+
+def _scrub_secrets(text: str) -> tuple[str, bool]:
+    return _scrub_text_impl(text)
+
+
+_SCHEMA_VERSION = 2
+
+
+def _close_qdrant():
+    global _qclient
+    if _qclient:
+        try:
+            _qclient.close()
+        except Exception:
+            pass
+        _qclient = None
+
+atexit.register(_close_qdrant)
+
+
+DENSE_MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+SPARSE_MODEL_NAME = "prithivida/Splade_PP_en_v1"
+EMBED_DIM = 384
+
+
+def _fastembed_providers() -> list[str] | None:
+    """Pick ONNX execution providers based on user preference.
+
+    Setting `embed_device` (or env `CASTOR_EMBED_DEVICE`) can be:
+      - "auto"  (default): FastEmbed decides — tries CUDA first if the GPU
+        onnxruntime is installed, else CPU. We return None to accept FastEmbed's
+        auto behavior, BUT we also wrap the init in a CUDA→CPU fallback below
+        because ONNX's own retry has historically been unreliable on Windows
+        when CUDA DLLs are missing.
+      - "cpu":  force ["CPUExecutionProvider"] — skip CUDA entirely, no noisy
+        stderr when CUDA is half-installed.
+      - "cuda": force ["CUDAExecutionProvider"] — error out loudly if it fails
+        instead of silently falling back to CPU. Useful for debugging.
+    """
+    mode = (os.environ.get("CASTOR_EMBED_DEVICE") or config.get("embed_device") or "auto").strip().lower()
+    if mode == "cpu":
+        return ["CPUExecutionProvider"]
+    if mode == "cuda":
+        return ["CUDAExecutionProvider"]
+    return None
+
+
+def _suppress_onnx_stderr():
+    """Temporary stderr redirect — ONNX prints noisy C-level error messages
+    ('LoadLibrary failed with error 126 …') to stderr even on successful
+    CPU-fallback. Return a (restore_fn, captured_text) pair.
+    """
+    import contextlib
+    class _Capture:
+        def __init__(self):
+            self.buf = []
+        def write(self, s):
+            self.buf.append(s)
+        def flush(self):
+            pass
+    cap = _Capture()
+    return contextlib.redirect_stderr(cap), cap
+
+
+def _init_fastembed(cls, model_name: str):
+    """Instantiate a FastEmbed model with (a) user-preferred providers,
+    (b) graceful CUDA→CPU fallback on any exception, (c) stderr suppression
+    during the first attempt so half-installed CUDA doesn't spam the user's
+    terminal with raw onnxruntime noise.
+    """
+    import warnings
+
+
+    try:
+        from loguru import logger as _lu
+        _lu.disable("fastembed")
+    except Exception:
+        pass
+    providers = _fastembed_providers()
+
+    init_kwargs = {"model_name": model_name}
+    if providers is not None:
+        init_kwargs["providers"] = providers
+    try:
+        ctx, cap = _suppress_onnx_stderr()
+        with ctx, warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            try:
+                return cls(**init_kwargs)
+            except Exception as first_err:
+                captured_noise = "".join(cap.buf)
+
+
+                if providers is None:
+                    _log.warning(
+                        f"FastEmbed auto-init failed ({type(first_err).__name__}: "
+                        f"{str(first_err)[:120]}); retrying with CPU provider"
+                    )
+                    if captured_noise.strip():
+                        _log.debug(f"onnxruntime noise during init: {captured_noise[:400]}")
+                    return cls(model_name=model_name, providers=["CPUExecutionProvider"])
+
+                raise
+    except Exception:
+        raise
+
+
+def _get_dense_model():
+    global _dense_model
+    if _dense_model is None:
+        with _dense_model_lock:
+            if _dense_model is None:
+                from fastembed import TextEmbedding
+                _dense_model = _init_fastembed(TextEmbedding, DENSE_MODEL_NAME)
+                _log.info(f"loaded dense model: {DENSE_MODEL_NAME}")
+    return _dense_model
+
+
+def _get_sparse_model():
+    global _sparse_model
+    if _sparse_model is None:
+        with _sparse_model_lock:
+            if _sparse_model is None:
+                from fastembed import SparseTextEmbedding
+                _sparse_model = _init_fastembed(SparseTextEmbedding, SPARSE_MODEL_NAME)
+                _log.info(f"loaded sparse model: {SPARSE_MODEL_NAME}")
+    return _sparse_model
+
+
+_sparse_fallback_count = 0
+_sparse_fallback_escalated = False
+
+
+def sparse_embed(text: str) -> SparseVector:
+    """Generate SPLADE++ sparse vector via FastEmbed (learned sparse, not BM25 hash)."""
+    global _sparse_fallback_count, _sparse_fallback_escalated
+    text = text.encode("utf-8", errors="replace").decode("utf-8")
+    try:
+        model = _get_sparse_model()
+        result = list(model.embed([text]))[0]
+        return SparseVector(
+            indices=result.indices.tolist(),
+            values=result.values.tolist(),
+        )
+    except Exception as e:
+        _sparse_fallback_count += 1
+        _log.warning(f"sparse embedding failed (count={_sparse_fallback_count}): {e}")
+        if _sparse_fallback_count >= 10 and not _sparse_fallback_escalated:
+            _sparse_fallback_escalated = True
+            _log.error(
+                "sparse embedding has failed %d times this session — search quality is degraded. "
+                "Check SPLADE model installation.", _sparse_fallback_count,
+            )
+        return SparseVector(indices=[0], values=[1.0])
+
+
+_sparse_embed = sparse_embed
+
+
+def _get_qdrant() -> QdrantClient:
+    global _qclient
+    if _qclient is None:
+        with _qclient_lock:
+            if _qclient is None:
+                if config.QDRANT_MODE == "memory":
+                    _qclient = QdrantClient(":memory:")
+                elif config.QDRANT_MODE == "disk":
+                    _qclient = QdrantClient(path=config.QDRANT_PATH)
+                else:
+                    _qclient = QdrantClient(url=config.QDRANT_URL)
+                _ensure_collection(_qclient, config.QDRANT_COLLECTION)
+    return _qclient
+
+
+def _ensure_collection(qc: QdrantClient, collection: str):
+    """Ensure collection exists with v2 schema. Migrate from v1 if needed."""
+    cols = [c.name for c in qc.get_collections().collections]
+
+
+    temp_name = f"{collection}_v2_migration"
+    if temp_name in cols:
+        _log.info("found interrupted migration, resuming from temp collection")
+        _resume_migration(qc, collection, temp_name)
+        return
+
+    if collection not in cols:
+        _create_collection_v2(qc, collection)
+        return
+
+
+    info = qc.get_collection(collection)
+    vectors_cfg = info.config.params.vectors
+
+    if isinstance(vectors_cfg, dict) and "dense" in vectors_cfg:
+
+        _ensure_payload_indexes(qc, collection)
+        return
+
+
+    _log.info("migrating memory collection v1 → v2 (named vectors + sparse)")
+    _migrate_v1_to_v2(qc, collection)
+
+
+def _create_collection_v2(qc: QdrantClient, collection: str):
+    """Create collection with v2 schema: named dense (float16) + sparse vectors."""
+    qc.create_collection(
+        collection,
+        vectors_config={
+            "dense": VectorParams(
+                size=EMBED_DIM,
+                distance=Distance.COSINE,
+                datatype=Datatype.FLOAT16,
+            ),
+        },
+        sparse_vectors_config={
+            "sparse": SparseVectorParams(
+                modifier="idf",
+            ),
+        },
+    )
+    _ensure_payload_indexes(qc, collection)
+    _log.info(f"created collection '{collection}' v2 (dense float16 + sparse + indexes)")
+
+
+def _ensure_payload_indexes(qc: QdrantClient, collection: str):
+    """Create payload indexes if they don't exist yet."""
+    try:
+        info = qc.get_collection(collection)
+        existing = set(info.payload_schema.keys()) if info.payload_schema else set()
+
+        indexes = {
+            "tag": PayloadSchemaType.KEYWORD,
+            "thread_id": PayloadSchemaType.KEYWORD,
+            "ts": PayloadSchemaType.FLOAT,
+            "synthesis_status": PayloadSchemaType.KEYWORD,
+            "synthesis_group": PayloadSchemaType.KEYWORD,
+            "file_path": PayloadSchemaType.KEYWORD,
+            "source_type": PayloadSchemaType.KEYWORD,
+            "document_tags": PayloadSchemaType.KEYWORD,
+        }
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            for field, schema_type in indexes.items():
+                if field not in existing:
+                    qc.create_payload_index(collection, field, schema_type)
+                    _log.info(f"created payload index: {field} ({schema_type})")
+
+            if "text" not in existing:
+                try:
+                    qc.create_payload_index(
+                        collection, "text",
+                        TextIndexParams(
+                            type="text",
+                            tokenizer=TokenizerType.WORD,
+                            min_token_len=2,
+                            lowercase=True,
+                        ),
+                    )
+                    _log.info("created full-text index on 'text'")
+                except Exception as e:
+                    _log.debug(f"full-text index creation skipped: {e}")
+    except Exception as e:
+        _log.debug(f"payload index creation skipped: {e}")
+
+
+def _migrate_v1_to_v2(qc: QdrantClient, collection: str):
+    """Migrate from v1 (unnamed vector) to v2 (named dense + sparse).
+
+    Uses a temp collection to avoid data loss on crash:
+    1. Read all points from v1
+    2. Create temp collection with v2 schema
+    3. Populate temp collection
+    4. Delete v1 collection
+    5. Create v2 collection and copy from temp
+    6. Delete temp
+    """
+    temp_name = f"{collection}_v2_migration"
+
+
+    all_points = []
+    offset = None
+    while True:
+        result = qc.scroll(collection, limit=100, offset=offset, with_vectors=True)
+        batch, offset = result
+        all_points.extend(batch)
+        if offset is None:
+            break
+
+    _log.info(f"read {len(all_points)} points from v1 collection")
+
+
+    new_points = []
+    for p in all_points:
+        text = p.payload.get("text", "") if p.payload else ""
+        sparse = sparse_embed(text) if text else SparseVector(indices=[0], values=[1.0])
+        new_points.append(PointStruct(
+            id=p.id,
+            vector={"dense": p.vector, "sparse": sparse},
+            payload=p.payload or {},
+        ))
+
+
+    cols = [c.name for c in qc.get_collections().collections]
+    if temp_name in cols:
+        qc.delete_collection(temp_name)
+    _create_collection_v2(qc, temp_name)
+
+    if new_points:
+        for i in range(0, len(new_points), 100):
+            qc.upsert(temp_name, points=new_points[i:i + 100])
+
+
+    qc.delete_collection(collection)
+    _create_collection_v2(qc, collection)
+
+    if new_points:
+        for i in range(0, len(new_points), 100):
+            qc.upsert(collection, points=new_points[i:i + 100])
+
+
+    qc.delete_collection(temp_name)
+    _log.info(f"migrated {len(new_points)} points to v2")
+
+
+def _resume_migration(qc: QdrantClient, collection: str, temp_name: str):
+    """Resume an interrupted v1→v2 migration from temp collection."""
+
+    all_points = []
+    offset = None
+    while True:
+        result = qc.scroll(temp_name, limit=100, offset=offset, with_vectors=True)
+        batch, offset = result
+        all_points.extend(batch)
+        if offset is None:
+            break
+
+
+    cols = [c.name for c in qc.get_collections().collections]
+    if collection in cols:
+        qc.delete_collection(collection)
+    _create_collection_v2(qc, collection)
+
+
+    if all_points:
+        for i in range(0, len(all_points), 100):
+            batch = all_points[i:i + 100]
+            pts = [PointStruct(
+                id=p.id,
+                vector={"dense": p.vector["dense"], "sparse": p.vector["sparse"]},
+                payload=p.payload or {},
+            ) for p in batch]
+            qc.upsert(collection, points=pts)
+
+    qc.delete_collection(temp_name)
+    _log.info(f"resumed migration: {len(all_points)} points recovered")
+
+
+def _embed(text: str) -> list[float]:
+    """Generate dense embedding via FastEmbed (ONNX, no server)."""
+    text = text.encode("utf-8", errors="replace").decode("utf-8")
+    try:
+        model = _get_dense_model()
+        result = list(model.embed([text]))[0]
+        return result.tolist()
+    except Exception as e:
+        _log.warning(f"embedding failed: {e}")
+        raise
+
+
+def embed(text: str) -> list[float]:
+    """Public wrapper — compute embedding vector for text.
+
+    Use this to cache the vector and pass it to search_by_vector()
+    to avoid redundant embedding API calls.
+    """
+    return _embed(text)
+
+
+def _build_filter(tag: str | None = None,
+                  thread_id: str | None = None) -> Filter | None:
+    """Build Qdrant filter from optional tag/thread_id."""
+    conditions = []
+    if tag:
+        conditions.append(FieldCondition(key="tag", match=MatchValue(value=tag)))
+    if thread_id:
+        conditions.append(FieldCondition(key="thread_id", match=MatchValue(value=thread_id)))
+    return Filter(must=conditions) if conditions else None
+
+
+def _points_to_dicts(points) -> list[dict]:
+    """Convert Qdrant scored points to dicts."""
+    out = []
+    for r in points:
+        item = {
+            "id": r.id,
+            "text": r.payload.get("text", ""),
+            "tag": r.payload.get("tag", ""),
+            "thread_id": r.payload.get("thread_id", ""),
+            "score": round(r.score, 3),
+            "ts": r.payload.get("ts", 0),
+        }
+
+        for k, v in r.payload.items():
+            if k not in item:
+                item[k] = v
+        out.append(item)
+    return out
+
+
+def _search_hybrid(qc, vector: list[float], text: str, limit: int,
+                   filt: Filter | None,
+                   score_threshold: float | None = None) -> list[dict]:
+    """3-way hybrid: BM25 (FTS5) + dense + sparse (SPLADE++) → RRF fusion."""
+    import db
+
+
+    bm25_ranked: list[tuple[str, float]] = []
+    try:
+        fts_hits = db.fts_search("fts_memory", text, limit=limit * 3)
+        for hit in fts_hits:
+            pid = hit.get("point_id", "")
+            bm25_score = -hit.get("rank", 0.0)
+            if pid:
+                bm25_ranked.append((pid, bm25_score))
+    except Exception:
+        pass
+
+
+    sparse = sparse_embed(text)
+    qdrant_results = []
+    try:
+        results = qc.query_points(
+            config.QDRANT_COLLECTION,
+            prefetch=[
+                Prefetch(query=sparse, using="sparse", limit=limit * 4,
+                         filter=filt),
+                Prefetch(query=vector, using="dense", limit=limit * 4,
+                         filter=filt),
+            ],
+            query=FusionQuery(fusion=Fusion.RRF),
+            limit=limit * 3,
+            score_threshold=score_threshold,
+        )
+        qdrant_results = results.points
+    except Exception as e:
+        _log.debug(f"hybrid search failed, falling back to dense-only: {e}")
+        qdrant_results = _search_dense_only_points(qc, vector, limit, filt, score_threshold)
+
+
+    if bm25_ranked and qdrant_results:
+        qdrant_ranked = [(str(r.id), r.score) for r in qdrant_results]
+        qdrant_payloads = {str(r.id): r for r in qdrant_results}
+        merged = db.rrf_merge([bm25_ranked, qdrant_ranked], limit=limit)
+
+        output = []
+        for pid, score in merged:
+            if pid in qdrant_payloads:
+                r = qdrant_payloads[pid]
+                d = {k: v for k, v in (r.payload or {}).items()}
+                d["id"] = str(r.id)
+                d["score"] = round(score, 4)
+                output.append(d)
+            else:
+
+                for hit in fts_hits:
+                    if hit.get("point_id") == pid:
+                        output.append({
+                            "id": pid, "text": hit.get("text", ""),
+                            "tag": hit.get("tag", ""), "score": round(score, 4),
+                        })
+                        break
+        return output
+
+
+    return _points_to_dicts(qdrant_results if qdrant_results else [])
+
+
+def _search_dense_only_points(qc, vector: list[float], limit: int,
+                              filt: Filter | None,
+                              score_threshold: float | None = None) -> list:
+    """Fallback: dense-only search returning raw Qdrant points."""
+    try:
+        results = qc.query_points(
+            config.QDRANT_COLLECTION,
+            query=vector,
+            using="dense",
+            limit=limit,
+            query_filter=filt,
+            score_threshold=score_threshold,
+        )
+    except Exception:
+        results = qc.query_points(
+            config.QDRANT_COLLECTION,
+            query=vector,
+            limit=limit,
+            query_filter=filt,
+            score_threshold=score_threshold,
+        )
+    return results.points
+
+
+def _search_dense_only(qc, vector: list[float], limit: int,
+                       filt: Filter | None,
+                       score_threshold: float | None = None) -> list[dict]:
+    """Fallback: dense-only search (for v1 collections or errors)."""
+    return _points_to_dicts(_search_dense_only_points(qc, vector, limit, filt, score_threshold))
+
+
+def _search_impl(vector: list[float], limit: int,
+                 tag: str | None, thread_id: str | None,
+                 query_text: str | None = None,
+                 score_threshold: float | None = None) -> list[dict]:
+    """Core search — uses hybrid (dense+sparse RRF) when query_text available.
+
+    score_threshold: if set, Qdrant filters results below this score
+    before returning — saves bandwidth and context budget.
+    """
+    try:
+        qc = _get_qdrant()
+    except Exception as e:
+        _log.warning(f"qdrant unavailable for search: {e}")
+        return []
+
+    filt = _build_filter(tag, thread_id)
+
+    if query_text:
+        return _search_hybrid(qc, vector, query_text, limit, filt, score_threshold)
+    else:
+        return _search_dense_only(qc, vector, limit, filt, score_threshold)
+
+
+def search(query: str, limit: int = config.MAX_MEMORY_RESULTS,
+           tag: str | None = None, thread_id: str | None = None,
+           score_threshold: float | None = None) -> list[dict]:
+    """Hybrid semantic + keyword search over memories.
+
+    Uses dense (embedding) + sparse (SPLADE++) vectors with RRF fusion
+    for best recall on both semantic and exact keyword matches.
+
+    Args:
+        query: search text
+        limit: max results
+        tag: filter by tag
+        thread_id: filter by thread (or None for global search)
+        score_threshold: minimum score cutoff (Qdrant-side filtering)
+
+    Returns [{text, tag, thread_id, score, ts, ...}]
+    """
+    try:
+        vector = _embed(query)
+    except Exception as e:
+        _log.warning(f"embedding unavailable for search: {e}")
+        return []
+    return _search_impl(vector, limit, tag, thread_id, query_text=query,
+                        score_threshold=score_threshold)
+
+
+def search_by_vector(vector: list[float], limit: int = config.MAX_MEMORY_RESULTS,
+                     tag: str | None = None, thread_id: str | None = None,
+                     query_text: str | None = None,
+                     score_threshold: float | None = None) -> list[dict]:
+    """Search using a pre-computed embedding vector.
+
+    If query_text is provided, uses hybrid search (dense + sparse RRF).
+    Otherwise falls back to dense-only search.
+    """
+    return _search_impl(vector, limit, tag, thread_id, query_text=query_text,
+                        score_threshold=score_threshold)
+
+
+_CHUNK_SIZE = 800
+_CHUNK_OVERLAP = 100
+_CHUNK_THRESHOLD = 1000
+
+
+def _chunk_text(text: str, size: int = _CHUNK_SIZE, overlap: int = _CHUNK_OVERLAP) -> list[str]:
+    """Split text into chunks on sentence boundaries.
+
+    Tries to split on '. ', '\\n', '! ', '? ' to preserve meaning.
+    Falls back to hard split at `size` if no boundary found.
+    """
+    if len(text) <= size:
+        return [text]
+
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + size
+        if end >= len(text):
+            chunks.append(text[start:])
+            break
+
+        best = -1
+        for sep in [". ", ".\n", "\n\n", "\n", "! ", "? ", "; "]:
+            idx = text.rfind(sep, start + size // 4, end)
+            if idx > best:
+                best = idx + len(sep)
+        if best <= start:
+            best = end
+        chunks.append(text[start:best])
+        start = best - overlap
+        if start < 0:
+            start = 0
+    return chunks
+
+
+def save(text: str, tag: str = "general", dedup: bool = True,
+         thread_id: str | None = None, meta: dict | None = None,
+         chunk: bool = True, synth: bool = False) -> str:
+    """Save a memory with both dense and sparse vectors.
+
+    Long texts (>1000 chars) are auto-chunked into ~800 char pieces by
+    default — better retrieval granularity for indexed knowledge.
+    Pass ``chunk=False`` to keep the text as a single atom regardless
+    of length (intended for direct user saves where the whole message
+    is one logical fact, e.g. the chat's Save-to-memory button — saving
+    one message and getting three retrieval-chunked entries back is
+    surprising UX).
+
+    Chunked saves always get synthesis_status="pending". Single-atom
+    saves default to "skip" (never processed by night synthesis), but
+    pass ``synth=True`` to override — useful for UI saves that should
+    still feed the entity/wiki extraction graph.
+
+    Args:
+        text: memory content
+        tag: category (general, user, knowledge, project, etc.)
+        dedup: if True, update existing memory if >0.9 similarity
+        thread_id: associate with a specific thread/topic
+        meta: extra metadata dict (source, source_type, etc.)
+        chunk: if True (default) auto-chunk texts > 1000 chars; if
+            False, save as one atom regardless of length
+        synth: if True, mark the save as synthesis_status="pending"
+            so night synthesis picks it up. Only applies to single-
+            atom saves (chunked saves are always pending).
+
+    Returns:
+        point ID (or first chunk ID for chunked saves)
+    """
+
+
+    text, scrubbed = _scrub_secrets(text)
+    if scrubbed:
+        hits = text.count("[REDACTED")
+        _log.warning(f"scrubbed {hits} secret-like pattern(s) from memory save (tag={tag})")
+
+
+    if chunk and len(text) > _CHUNK_THRESHOLD and tag not in ("experience", "compaction"):
+        return _save_chunked(text, tag, thread_id, meta)
+
+
+    return _save_single(text, tag, dedup, thread_id, meta,
+                        synthesis_status="pending" if synth else "skip",
+                        scrub=False)
+
+
+def _save_chunked(text: str, tag: str,
+                  thread_id: str | None, meta: dict | None) -> str:
+    """Save long text as multiple chunks with synthesis metadata."""
+    chunks = _chunk_text(text)
+    source = (meta or {}).get("source", f"mem_{int(time.time())}")
+    group = f"{source}_{int(time.time())}"
+    first_id = None
+
+    _log.info(f"chunking text ({len(text)} chars) into {len(chunks)} chunks, group={group}")
+
+    for i, chunk in enumerate(chunks):
+        chunk_meta = dict(meta or {})
+        chunk_meta.update({
+            "synthesis_status": "pending",
+            "synthesis_group": group,
+            "chunk_index": i,
+            "chunk_total": len(chunks),
+            "source": source,
+        })
+
+
+        pid = _save_single(chunk, tag, dedup=False, thread_id=thread_id,
+                           meta=chunk_meta, synthesis_status="pending",
+                           scrub=False)
+        if i == 0:
+            first_id = pid
+
+    return first_id or ""
+
+
+def _save_single(text: str, tag: str, dedup: bool = True,
+                 thread_id: str | None = None, meta: dict | None = None,
+                 synthesis_status: str = "skip",
+                 scrub: bool = True) -> str:
+    """Save a single memory point to Qdrant + FTS5.
+
+    ``scrub`` (default True) runs ``secret_scrub.scrub_text`` over ``text``
+    BEFORE embedding/persistence. The public ``memory.save`` entry point
+    scrubs at its own boundary and passes ``scrub=False`` to avoid double
+    work. Direct callers — notably ``synthesis._save_*`` paths that
+    persist LLM-summarised wiki/entity descriptions and bypass ``save``
+    — get the default scrub for free. v0.23.4: cross-cutting §4.1 fix.
+    """
+    if scrub:
+        text, was_scrubbed = _scrub_secrets(text)
+        if was_scrubbed:
+            hits = text.count("[REDACTED")
+            _log.warning(
+                f"scrubbed {hits} secret-like pattern(s) from memory save (tag={tag})"
+            )
+    qc = _get_qdrant()
+    try:
+        dense_vector = _embed(text)
+    except Exception as e:
+        _log.warning(f"embedding failed in save(): {e}")
+        raise
+    sparse_vector = sparse_embed(text)
+
+    payload = {
+        "text": text,
+        "tag": tag,
+        "ts": time.time(),
+        "synthesis_status": synthesis_status,
+    }
+    if thread_id:
+        payload["thread_id"] = thread_id
+    if meta:
+        payload.update(meta)
+
+    vectors = {"dense": dense_vector, "sparse": sparse_vector}
+
+
+    if dedup:
+        try:
+            dedup_filter = Filter(must=[
+                FieldCondition(key="tag", match=MatchValue(value=tag))
+            ])
+            results = qc.query_points(
+                config.QDRANT_COLLECTION, query=dense_vector,
+                using="dense", limit=1,
+                query_filter=dedup_filter,
+            )
+            if results.points and results.points[0].score > 0.9:
+                existing = results.points[0]
+                qc.upsert(
+                    config.QDRANT_COLLECTION,
+                    points=[PointStruct(
+                        id=existing.id, vector=vectors, payload=payload,
+                    )],
+                )
+                import db
+                db.fts_upsert("fts_memory", "point_id", str(existing.id),
+                              {"tag": tag, "text": text})
+                _write_markdown_companion(str(existing.id), text, tag, thread_id, meta)
+                return str(existing.id)
+        except Exception as e:
+            _log.debug(f"dedup check failed, saving as new: {e}")
+
+    point_id = str(uuid.uuid4())
+    qc.upsert(
+        config.QDRANT_COLLECTION,
+        points=[PointStruct(id=point_id, vector=vectors, payload=payload)],
+    )
+    import db
+    db.fts_upsert("fts_memory", "point_id", point_id, {"tag": tag, "text": text})
+    _write_markdown_companion(point_id, text, tag, thread_id, meta)
+    return point_id
+
+
+def _write_markdown_companion(point_id: str, text: str, tag: str,
+                                thread_id: str | None, meta: dict | None) -> None:
+    """Mirror a saved memory to its markdown file.
+
+    Phase 1 of Living Memory: every Qdrant save also writes a .md file
+    under ``~/.castor/memories/atoms/<shard>/mem_<id>.md``. Markdown is
+    canonical, Qdrant is the derived search index (see ADR-0001).
+
+    Swallows all exceptions — the companion file is best-effort for now.
+    If markdown write fails, the Qdrant save still succeeded; the
+    ``memory_store.backfill_from_qdrant`` pass on next boot will try
+    again. Once Phase 2 lands this must become a hard dependency.
+    """
+    try:
+        import memory_store
+        memory_store.write(point_id, text, tag=tag,
+                            thread_id=thread_id, meta=meta)
+    except Exception as e:
+        _log.debug(f"markdown companion write failed for {point_id}: {e}")
+
+
+def get_pending_synthesis(limit: int = 50) -> dict[str, list[dict]]:
+    """Get pending synthesis items grouped by synthesis_group.
+
+    Returns: {group_name: [{"id": ..., "text": ..., "tag": ..., ...}, ...]}
+    """
+    qc = _get_qdrant()
+    try:
+        results = qc.scroll(
+            config.QDRANT_COLLECTION,
+            scroll_filter=Filter(must=[
+                FieldCondition(key="synthesis_status",
+                               match=MatchValue(value="pending"))
+            ]),
+            limit=limit,
+            with_payload=True,
+            with_vectors=False,
+        )
+        points = results[0] if results else []
+        groups: dict[str, list[dict]] = {}
+        for p in points:
+            group = p.payload.get("synthesis_group", "ungrouped")
+            entry = {"id": p.id, **p.payload}
+            groups.setdefault(group, []).append(entry)
+        return groups
+    except Exception as e:
+        _log.warning(f"get_pending_synthesis failed: {e}")
+        return {}
+
+
+def mark_synthesized(point_ids: list[str]):
+    """Mark points as synthesized (status=done)."""
+    qc = _get_qdrant()
+    for pid in point_ids:
+        try:
+            qc.set_payload(
+                config.QDRANT_COLLECTION,
+                payload={"synthesis_status": "done"},
+                points=[pid],
+            )
+        except Exception as e:
+            _log.warning(f"mark_synthesized failed for {pid}: {e}")
+
+
+def get_all_entities(limit: int = 200) -> list[dict]:
+    """Get all entity nodes for graph visualization.
+
+    Returns list of {id, name, type, description, relations, observation_count}.
+    """
+    qc = _get_qdrant()
+    try:
+        results = qc.scroll(
+            config.QDRANT_COLLECTION,
+            scroll_filter=Filter(must=[
+                FieldCondition(key="tag", match=MatchValue(value="entity"))
+            ]),
+            limit=limit,
+            with_payload=True,
+            with_vectors=False,
+        )
+        points = results[0] if results else []
+        entities = []
+        for p in points:
+            entities.append({
+                "id": str(p.id),
+                "name": p.payload.get("text", ""),
+                "type": p.payload.get("entity_type", "concept"),
+                "description": p.payload.get("description", ""),
+                "relations": p.payload.get("relations", []),
+                "observation_count": p.payload.get("observation_count", 1),
+            })
+        return entities
+    except Exception as e:
+        _log.warning(f"get_all_entities failed: {e}")
+        return []
+
+
+def _entity_key(name: str) -> str:
+    """Canonical key for entity-identity comparison: trimmed + casefolded."""
+    return (name or "").strip().casefold()
+
+
+def merge_entity_group(group: list[dict]) -> dict:
+    """Pure merge of N same-named entity dicts into one.
+
+    Union of relations (dedup by (to, rel)), summed observation_count,
+    longest non-empty description, first node's type + display casing.
+    No I/O — unit-testable. Caller persists the result.
+    """
+    name = next((e["name"].strip() for e in group if e.get("name", "").strip()), "")
+    etype = group[0].get("type", "concept")
+    obs = 0
+    desc = ""
+    rels: list[dict] = []
+    seen: set[tuple] = set()
+    for e in group:
+        obs += int(e.get("observation_count", 1) or 1)
+        d = e.get("description", "") or ""
+        if len(d) > len(desc):
+            desc = d
+        for r in e.get("relations", []) or []:
+            k = (r.get("to"), r.get("rel"))
+            if k not in seen:
+                seen.add(k)
+                rels.append(r)
+    return {"name": name, "type": etype, "description": desc,
+            "relations": rels, "observation_count": obs}
+
+
+def find_entities_by_name(name: str) -> list[dict]:
+    """All entity nodes whose name matches ``name`` (trim + casefold).
+
+    Entity identity is by NAME (relations reference targets by name, not
+    point id), so duplicates share a name. Used by synthesis upsert to find
+    the canonical node reliably — the fuzzy ``search(limit=1)`` path missed
+    exact matches when a near-name node out-ranked it, spawning duplicates.
+    """
+    key = _entity_key(name)
+    if not key:
+        return []
+    return [e for e in get_all_entities(limit=10000) if _entity_key(e.get("name", "")) == key]
+
+
+def dedupe_entities() -> dict:
+    """Collapse same-named duplicate entity nodes into one each.
+
+    Merges relations + observation_count, deletes the extras, recreates a
+    single canonical node per name. Returns ``{groups, removed}``. Safe to
+    run repeatedly (no-op once clean). Identity is by NAME so the recreated
+    node keeps every inbound/outbound relation reference intact.
+    """
+    from collections import defaultdict
+    groups: dict[str, list[dict]] = defaultdict(list)
+    for e in get_all_entities(limit=10000):
+        groups[_entity_key(e.get("name", ""))].append(e)
+
+    merged_groups = 0
+    removed = 0
+    for key, grp in groups.items():
+        if not key or len(grp) <= 1:
+            continue
+        merged = merge_entity_group(grp)
+        for e in grp:
+            try:
+                delete(e["id"])
+            except Exception as ex:
+                _log.warning(f"dedupe_entities: delete {e.get('id')} failed: {ex}")
+        try:
+            _save_single(
+                text=merged["name"], tag="entity", dedup=False,
+                meta={
+                    "entity_type": merged["type"],
+                    "description": merged["description"],
+                    "relations": merged["relations"],
+                    "observation_count": merged["observation_count"],
+                    "last_synthesized": time.time(),
+                    "synthesis_status": "done",
+                },
+            )
+        except Exception as ex:
+            _log.warning(f"dedupe_entities: recreate '{merged['name']}' failed: {ex}")
+            continue
+        merged_groups += 1
+        removed += len(grp) - 1
+    _log.info(f"dedupe_entities: merged {merged_groups} group(s), removed {removed} duplicate node(s)")
+    return {"groups": merged_groups, "removed": removed}
+
+
+def upsert_with_id(point_id: str, *, text: str, tag: str,
+                   thread_id: str | None = None,
+                   meta: dict | None = None,
+                   synthesis_status: str = "skip") -> None:
+    """Re-embed and upsert a memory under an EXISTING point_id.
+
+    Companion to :func:`_save_single` which always allocates a fresh
+    UUID. The reindex path needs to preserve ids so cross-references
+    (entity ``relations[].to`` pointing at another entity by name, or
+    wiki referencing entity ids) stay valid after rebuild.
+
+    Skips the markdown-companion write — the markdown atom is the
+    SOURCE of truth in this code path; we only need to refresh the
+    Qdrant + FTS5 derived indexes.
+    """
+    qc = _get_qdrant()
+    dense_vector = _embed(text)
+    sparse_vector = sparse_embed(text)
+    payload = {
+        "text": text,
+        "tag": tag,
+        "ts": time.time(),
+        "synthesis_status": synthesis_status,
+    }
+    if thread_id:
+        payload["thread_id"] = thread_id
+    if meta:
+        payload.update(meta)
+    qc.upsert(
+        config.QDRANT_COLLECTION,
+        points=[PointStruct(
+            id=point_id,
+            vector={"dense": dense_vector, "sparse": sparse_vector},
+            payload=payload,
+        )],
+    )
+    import db
+    db.fts_upsert("fts_memory", "point_id", point_id,
+                  {"tag": tag, "text": text})
+
+
+def reindex_from_markdown(*, skip_existing: bool = True) -> dict:
+    """Walk all markdown atoms and ensure each is present in Qdrant + FTS5.
+
+    Recovery path for a Qdrant ↔ markdown desync — observed when the
+    Qdrant collection gets wiped (e.g. via ``/api/knowledge/graph/clear``
+    or a corrupt-rebuild) while the canonical markdown layer survives.
+    Symptom: ``memory.search`` returns 0 results and the knowledge-graph
+    view is empty even though ``~/.castor/memories/atoms/`` contains
+    hundreds of files.
+
+    ``skip_existing=True`` (default) scans Qdrant once at the start to
+    collect point ids that are already present and skips them — keeps
+    a no-op reindex fast on an already-healthy install.
+
+    Returns a stats dict ``{scanned, written, skipped, errors}``. Never
+    raises — a malformed atom is logged and counted toward ``errors``
+    so the rest of the sweep continues.
+    """
+    import memory_store
+    ids = memory_store.iter_all()
+    scanned = written = skipped = errors = 0
+
+    existing: set[str] = set()
+    if skip_existing:
+        try:
+            qc = _get_qdrant()
+            offset = None
+
+
+            while True:
+                batch, next_offset = qc.scroll(
+                    config.QDRANT_COLLECTION,
+                    limit=1000,
+                    offset=offset,
+                    with_payload=False,
+                    with_vectors=False,
+                )
+                if not batch:
+                    break
+                existing.update(str(p.id) for p in batch)
+                if next_offset is None:
+                    break
+                offset = next_offset
+        except Exception as e:
+            _log.warning(f"reindex: pre-scroll failed, will not skip any: {e}")
+            existing = set()
+
+    for pid in ids:
+        scanned += 1
+        if skip_existing and pid in existing:
+            skipped += 1
+            continue
+        atom = memory_store.read(pid)
+        if not atom or not atom.get("text"):
+            errors += 1
+            continue
+        try:
+            upsert_with_id(
+                pid,
+                text=atom["text"],
+                tag=atom.get("tag") or "general",
+                thread_id=atom.get("thread_id"),
+                meta=atom.get("meta") or {},
+            )
+            written += 1
+        except Exception:
+            _log.exception(f"reindex: upsert failed for {pid}")
+            errors += 1
+
+    _log.info(
+        f"reindex_from_markdown: scanned={scanned} written={written} "
+        f"skipped={skipped} errors={errors}"
+    )
+    return {
+        "scanned": scanned,
+        "written": written,
+        "skipped": skipped,
+        "errors": errors,
+    }
+
+
+def delete(point_id: str) -> bool:
+    """Delete a single memory by its point ID (Qdrant + FTS5 + markdown)."""
+    try:
+        qc = _get_qdrant()
+        qc.delete(config.QDRANT_COLLECTION, points_selector=[point_id])
+    except Exception:
+        return False
+    import db
+    db.fts_delete("fts_memory", "point_id", point_id)
+
+    try:
+        import memory_store
+        memory_store.delete(point_id)
+    except Exception as e:
+        _log.debug(f"markdown companion delete failed for {point_id}: {e}")
+    return True
+
+
+def cleanup(max_age_days: int = 7, tag: str = "session"):
+    """Remove old memories by tag. Returns count deleted."""
+    qc = _get_qdrant()
+    cutoff = time.time() - (max_age_days * 86400)
+    try:
+        from qdrant_client.models import FilterSelector
+        qc.delete(
+            config.QDRANT_COLLECTION,
+            points_selector=FilterSelector(
+                filter=Filter(must=[
+                    FieldCondition(key="tag", match=MatchValue(value=tag)),
+                    FieldCondition(key="ts", range=Range(lt=cutoff)),
+                ])
+            ),
+        )
+    except Exception:
+        pass
+
+
+def clear_graph():
+    """Delete all entity and wiki memories (clears the knowledge graph)."""
+    qc = _get_qdrant()
+    deleted = 0
+    try:
+        from qdrant_client.models import FilterSelector
+        for tag in ("entity", "wiki"):
+            qc.delete(
+                config.QDRANT_COLLECTION,
+                points_selector=FilterSelector(
+                    filter=Filter(must=[
+                        FieldCondition(key="tag", match=MatchValue(value=tag)),
+                    ])
+                ),
+            )
+            _log.info(f"cleared graph: tag={tag}")
+            deleted += 1
+    except Exception as e:
+        _log.warning(f"clear_graph failed: {e}")
+    return deleted
+
+
+def count() -> int:
+    """Count total memories."""
+    try:
+        qc = _get_qdrant()
+        info = qc.get_collection(config.QDRANT_COLLECTION)
+        return info.points_count or 0
+    except Exception:
+        return 0

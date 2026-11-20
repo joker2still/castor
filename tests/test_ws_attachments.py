@@ -1,0 +1,409 @@
+"""WebSocket attachment handling — document + image upload round-trip.
+
+The v2 composer ships files via the WS ``document`` field (``pendingAttachments``
+array in ``static/index.html`` → ``ws.send({text, document: {filename, file_b64}})``).
+The server decodes the base64 payload, writes it to ``UPLOADS_DIR``, and
+injects a ``[File attached: …]`` reference into ``user_input`` so the agent
+can pull the contents on demand with ``read_file``.
+
+These tests lock in that plumbing end-to-end (WS client → server bytes on
+disk → agent invocation args) without running the LLM. ``_run_agent_sync``
+is monkeypatched to capture its kwargs and return a canned result, so the
+test is deterministic and fast.
+"""
+from __future__ import annotations
+
+import base64
+import importlib
+import os
+import shutil
+import sys
+import tempfile
+from pathlib import Path
+
+import pytest
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _ws_attach_env():
+    """Point CASTOR_DATA_DIR at a fresh tempdir and reload server."""
+    original = os.environ.get("CASTOR_DATA_DIR")
+    tmp_root = Path(tempfile.mkdtemp(prefix="qwe_ws_attach_"))
+    os.environ["CASTOR_DATA_DIR"] = str(tmp_root)
+    _reload_core()
+    try:
+        yield tmp_root
+    finally:
+        _close_db()
+        if original is not None:
+            os.environ["CASTOR_DATA_DIR"] = original
+        else:
+            os.environ.pop("CASTOR_DATA_DIR", None)
+        if tmp_root.exists():
+            shutil.rmtree(tmp_root, ignore_errors=True)
+        _reload_core()
+
+
+def _close_db():
+    db_mod = sys.modules.get("db")
+    if db_mod is None:
+        return
+    try:
+        _local = getattr(db_mod, "_local", None)
+        conn = getattr(_local, "conn", None) if _local else None
+        if conn is not None:
+            conn.close()
+        if _local is not None:
+            _local.conn = None
+        db_mod._migrated = False
+    except Exception:
+        pass
+
+
+def _reload_core():
+    _close_db()
+    for mod in ("config", "db", "soul", "threads", "presets", "server"):
+        if mod in sys.modules:
+            importlib.reload(sys.modules[mod])
+        else:
+            importlib.import_module(mod)
+
+
+@pytest.fixture
+def client(monkeypatch):
+    """Fresh TestClient per test — WS state is per-connection anyway.
+
+    The WS handler synchronously probes ``{lmstudio|ollama}/api/v1/models``
+    with a 5s ``requests.get`` timeout before kicking off the agent. Under
+    test we force the active provider to something neither local nor
+    cloud, so that branch skips and we don't sit on a 5s DNS failure.
+    """
+    from fastapi.testclient import TestClient
+    import providers
+    import server
+
+
+    server._AUTH_PASSWORD = ""
+    monkeypatch.setattr(providers, "get_active_name", lambda: "fake", raising=False)
+    with TestClient(server.app) as c:
+        yield c
+
+
+@pytest.fixture
+def captured_agent_call(monkeypatch):
+    """Replace server._run_agent_sync with a stub that captures its args.
+
+    Returns a list that each WS turn appends to: ``{user_input, thread_id,
+    image_b64, image_path, file_meta, abort_event, ctx}``. The stub returns
+    a minimal valid result dict so the WS reply assembly doesn't crash.
+    """
+    import server
+
+    captured: list[dict] = []
+
+    def _fake_run(user_input, thread_id=None, image_b64=None, image_path=None,
+                   file_meta=None, abort_event=None, ctx=None):
+        captured.append({
+            "user_input": user_input,
+            "thread_id": thread_id,
+            "image_b64": image_b64,
+            "image_path": image_path,
+            "file_meta": file_meta,
+            "abort_event": abort_event,
+            "ctx": ctx,
+        })
+        return {
+            "reply": "ok",
+            "thinking": "",
+            "tools": [],
+            "duration_ms": 1,
+            "context_hits": 0,
+            "thread_id": thread_id or "t-test",
+            "tokens": 0,
+            "prompt_tokens": 0,
+            "tok_per_sec": 0,
+        }
+
+    monkeypatch.setattr(server, "_run_agent_sync", _fake_run, raising=True)
+    return captured
+
+
+def _recv_reply(ws, timeout: float = 3.0) -> dict:
+    """Drain WS messages until we see a ``reply`` (or timeout)."""
+    import time
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            msg = ws.receive_json()
+        except Exception:
+            break
+        if isinstance(msg, dict) and msg.get("type") == "reply":
+            return msg
+    raise AssertionError("never received a reply frame within timeout")
+
+
+def test_ws_document_written_to_uploads_and_referenced_in_user_input(
+    client, captured_agent_call
+):
+    """Send {text, document} → file lands on disk + user_input gets the [File attached: ...] ref."""
+    import server
+
+    body = b"hello from the test"
+    payload = {
+        "text": "summarize this please",
+        "document": {
+            "filename": "notes.txt",
+            "file_b64": base64.b64encode(body).decode("ascii"),
+        },
+    }
+
+    with client.websocket_connect("/ws") as ws:
+        ws.send_json(payload)
+        _recv_reply(ws)
+
+    assert len(captured_agent_call) == 1, "agent should have been invoked exactly once"
+    call = captured_agent_call[0]
+
+
+    assert "summarize this please" in call["user_input"]
+    assert "[File attached: notes.txt" in call["user_input"]
+    assert "read_file(path)" in call["user_input"], (
+        "reference should tell the agent how to read the contents"
+    )
+
+
+    fm = call["file_meta"]
+    assert fm is not None
+    assert fm["name"] == "notes.txt"
+    assert fm["size"] == len(body)
+
+
+    path = Path(fm["path"]).resolve()
+    assert path.exists(), f"upload file not written at {path}"
+    assert path.read_bytes() == body
+
+
+    assert server.UPLOADS_DIR.resolve() in path.parents
+
+
+def test_ws_document_filename_sanitized_against_path_traversal(
+    client, captured_agent_call
+):
+    """A crafted filename with .. / slashes / null bytes cannot escape UPLOADS_DIR."""
+    import server
+
+    payload = {
+        "text": "",
+        "document": {
+            "filename": "../../../etc/passwd\x00.txt",
+            "file_b64": base64.b64encode(b"evil").decode("ascii"),
+        },
+    }
+
+    with client.websocket_connect("/ws") as ws:
+        ws.send_json(payload)
+        _recv_reply(ws)
+
+    call = captured_agent_call[0]
+    fm = call["file_meta"]
+    assert fm is not None
+    path = Path(fm["path"]).resolve()
+
+
+    assert server.UPLOADS_DIR.resolve() in path.parents, (
+        f"sanitizer failed — upload landed at {path}, outside {server.UPLOADS_DIR.resolve()}"
+    )
+
+    assert ".." not in path.name
+    assert "\x00" not in path.name
+
+
+def test_ws_empty_text_plus_document_still_runs_agent(client, captured_agent_call):
+    """Dragging a file in with no typed text should still invoke the agent."""
+    payload = {
+        "text": "",
+        "document": {
+            "filename": "plain.md",
+            "file_b64": base64.b64encode(b"# heading").decode("ascii"),
+        },
+    }
+    with client.websocket_connect("/ws") as ws:
+        ws.send_json(payload)
+        _recv_reply(ws)
+
+    assert captured_agent_call, "agent not invoked for doc-only message"
+
+    assert "[File attached: plain.md" in captured_agent_call[0]["user_input"]
+
+
+def test_ws_empty_payload_is_ignored(client, captured_agent_call):
+    """No text + no attachment → server silently skips, no agent call."""
+    with client.websocket_connect("/ws") as ws:
+        ws.send_json({"text": "", "thread_id": None})
+
+
+        ws.send_json({"text": "second try"})
+        _recv_reply(ws)
+
+    assert len(captured_agent_call) == 1, (
+        f"expected the empty msg to be skipped, got {len(captured_agent_call)} calls"
+    )
+    assert captured_agent_call[0]["user_input"] == "second try"
+
+
+def test_ws_image_b64_written_as_png_to_uploads(client, captured_agent_call):
+    """image_b64 decodes to disk as /uploads/{id}.png and the path is passed to the agent."""
+    import server
+
+
+    raw = bytes.fromhex("89504e470d0a1a0a0000000d49484452")
+    payload = {
+        "text": "what's in this image?",
+        "image_b64": base64.b64encode(raw).decode("ascii"),
+    }
+    with client.websocket_connect("/ws") as ws:
+        ws.send_json(payload)
+        _recv_reply(ws)
+
+    call = captured_agent_call[0]
+    assert call["image_b64"] is not None, "image_b64 should be forwarded to agent"
+    assert call["image_path"] is not None
+    assert call["image_path"].startswith("/uploads/")
+    assert call["image_path"].endswith(".png")
+
+
+    fname = call["image_path"].rsplit("/", 1)[-1]
+    disk_path = server.UPLOADS_DIR / fname
+    assert disk_path.exists()
+    assert disk_path.read_bytes() == raw
+
+
+def test_ws_document_and_image_can_coexist(client, captured_agent_call):
+    """A single turn carrying both image_b64 AND document → both arrive intact."""
+    raw_img = bytes.fromhex("89504e470d0a1a0a")
+    raw_doc = b"readme body"
+    payload = {
+        "text": "look at these",
+        "image_b64": base64.b64encode(raw_img).decode("ascii"),
+        "document": {
+            "filename": "readme.txt",
+            "file_b64": base64.b64encode(raw_doc).decode("ascii"),
+        },
+    }
+    with client.websocket_connect("/ws") as ws:
+        ws.send_json(payload)
+        _recv_reply(ws)
+
+    call = captured_agent_call[0]
+    assert call["image_path"] and call["image_path"].startswith("/uploads/")
+    assert call["file_meta"] and call["file_meta"]["name"] == "readme.txt"
+    assert "[File attached: readme.txt" in call["user_input"]
+    assert "look at these" in call["user_input"]
+
+
+# ── Reload contract: meta.files images must stay inline ──────────────
+
+
+def test_reload_path_runs_meta_files_through_splitfiles():
+    """Reported: an image the agent sent via send_file shows inline
+    during the live turn but flips to a download link after the user
+    leaves the thread and comes back.
+
+    Root cause: the live WS path runs `msg.files` through splitFiles()
+    so image-typed entries become inline `<img>` and the rest become
+    download chips. The reload path (loadActiveMessages → /api/history
+    → state.messages.map) was treating ALL of `meta.files` as plain
+    attachments — no split — so an image PNG re-emerged as a download
+    link.
+
+    Fix lives in static/index.html. This test pins the contract by
+    reading the file and asserting splitFiles is invoked when
+    processing meta.files in the reload mapper. Cheap regression
+    guard — fails loud if a refactor drops it.
+    """
+    from pathlib import Path
+    src = (Path(__file__).resolve().parent.parent / "static" / "index.html").read_text(encoding="utf-8")
+
+
+    anchor = "if (Array.isArray(meta.files))"
+    idx = src.find(anchor)
+    assert idx >= 0, "reload mapper handling of meta.files not found — was it renamed?"
+
+    window = src[idx: idx + 600]
+    assert "splitFiles(meta.files)" in window, (
+        "loadActiveMessages no longer routes meta.files through splitFiles(). "
+        "Without the split, image-typed entries (.png/.jpg/.gif/etc — typically "
+        "produced by send_file or camera_capture) render as download chips on "
+        "reload instead of inline images. The live WS path splits them; the "
+        "reload path must mirror that. Restore the splitFiles call in "
+        "static/index.html::loadActiveMessages."
+    )
+
+
+def test_reply_event_preserves_streaming_tool_results():
+    """Reported: skill runs and returns data, but user can't see its output.
+
+    Root cause: when the `reply` WS event arrives, the handler replaces
+    s.tools with msg.tools.map(...) where every tool gets result:''. Since
+    server sends result.tool_calls_made — a list of name strings — this
+    wipes the args + results that tool_call/tool_end events accumulated
+    during streaming.  User sees empty tool bubbles even though the skill
+    ran successfully.
+
+    Fix: when msg.tools is all strings (allStrings check), skip the replace
+    so the streaming-populated s.tools is preserved.
+
+    This test pins that contract by asserting the allStrings guard exists
+    in the reply event handler.
+    """
+    from pathlib import Path
+    src = (Path(__file__).resolve().parent.parent / "static" / "index.html").read_text(encoding="utf-8")
+
+    anchor = "keep s.tools as-is — results from streaming events are preserved"
+    assert anchor in src, (
+        "reply event handler no longer guards against wiping streaming tool results. "
+        "When msg.tools is a list of name strings (as server always sends), replacing "
+        "s.tools sets result:'' on every tool bubble — erasing data the user should see. "
+        "Restore the allStrings guard in static/index.html's 'reply' event handler."
+    )
+
+    idx = src.find(anchor)
+    window = src[max(0, idx - 600): idx + 50]
+    assert "allStrings" in window, (
+        "allStrings variable not found near the streaming-results guard comment. "
+        "The guard must check that all msg.tools entries are strings before skipping "
+        "the s.tools replacement."
+    )
+
+
+def test_soul_trait_description_uses_low_high_not_raw_object():
+    """Reported: Settings → Soul shows '[object Object]' next to every
+    built-in trait (humor, honesty, etc.).
+
+    Root cause: ``/api/soul`` returns ``traits`` as
+    ``{name: {low, high, builtin}}``, an object per trait — not a string.
+    The ``traitRow`` helper in ``renderTabSoul`` was doing
+    ``esc(descriptions[name] || 'built-in trait')``; passing an object
+    to ``esc()`` coerces it to ``[object Object]``.
+
+    Fix: built-in branch now reads ``descriptions[name].low`` and
+    ``descriptions[name].high``, matching what the custom-trait branch
+    already did.  This test pins the contract.
+    """
+    from pathlib import Path
+    src = (Path(__file__).resolve().parent.parent / "static" / "index.html").read_text(encoding="utf-8")
+
+    anchor = "const traitRow = (name, isCustom, customMeta) =>"
+    idx = src.find(anchor)
+    assert idx >= 0, "traitRow helper not found — was it renamed?"
+    window = src[idx: idx + 600]
+    # The built-in branch must NOT pass the raw descriptions[name] object to esc()
+    assert "esc(descriptions[name])" not in window, (
+        "Built-in trait description is passed raw to esc() — objects coerce to "
+        "[object Object].  Use descriptions[name].low / .high instead."
+    )
+    # The built-in branch must dereference .low and .high
+    assert "descriptions[name].low" in window and "descriptions[name].high" in window, (
+        "traitRow built-in branch must read .low and .high from the description "
+        "object returned by /api/soul, not use it as a bare string."
+    )

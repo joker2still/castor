@@ -1,0 +1,606 @@
+"""Smoke + unit tests for skill_creator.
+
+The module is 1318 lines and was shipped without tests. This file pins
+the parts that don't need an LLM:
+
+- pure helpers (_sanitize_id, _infer_op, _extract_json, _extract_code,
+  _fix_indentation, _fix_empty_blocks, _build_table_ddl)
+- the deterministic mapping path (_build_mapping_from_tools +
+  _assemble_from_mapping) — this is step 3 of the pipeline that
+  *replaces* the LLM call when tool ops are recognisable
+- end-to-end pipeline with a fully mocked _llm_call returning canned
+  plan + tools JSON
+
+Doesn't pin: real LLM calls, threading-based async, the notify side
+channel — those need integration env which is out of scope here.
+"""
+
+from __future__ import annotations
+
+import importlib
+import json
+import sys
+from pathlib import Path
+
+import pytest
+
+
+@pytest.fixture
+def sc(qwe_temp_data_dir):
+    """Reload skill_creator against a fresh temp CASTOR_DATA_DIR.
+
+    Important because USER_SKILLS_DIR resolves at import time off
+    config.DATA_DIR — without this, tests would write to the real
+    user's ~/.castor/skills/.
+    """
+    if "skills.skill_creator" in sys.modules:
+        del sys.modules["skills.skill_creator"]
+    if "skills" in sys.modules:
+        importlib.reload(sys.modules["skills"])
+    import skills.skill_creator as sc
+    return sc
+
+
+def test_sanitize_id_strips_non_alnum(sc):
+    assert sc._sanitize_id("My Cool Skill") == "MyCoolSkill"
+    assert sc._sanitize_id("test-123_foo") == "test123_foo"
+    assert sc._sanitize_id("foo.bar/baz") == "foobarbaz"
+
+
+def test_infer_op_recognises_known_verbs(sc):
+    assert sc._infer_op("add_workout") == "add"
+    assert sc._infer_op("list_users") == "list"
+    assert sc._infer_op("delete_record") == "delete"
+    assert sc._infer_op("update_status") == "update"
+    assert sc._infer_op("get_info") == "get"
+    assert sc._infer_op("fetch_balance") == "get"
+    assert sc._infer_op("compute_stats") == "stats"
+
+    assert sc._infer_op("perform_xyz") == "custom"
+
+
+def test_extract_json_plain_dict(sc):
+    assert sc._extract_json('{"a": 1, "b": "x"}') == {"a": 1, "b": "x"}
+
+
+def test_extract_json_with_thinking_prefix(sc):
+    raw = "<think>let me plan</think>\n```json\n{\"plan\": \"do x\"}\n```"
+    assert sc._extract_json(raw) == {"plan": "do x"}
+
+
+def test_extract_json_dict_inside_prose(sc):
+
+    raw = "Here you go: {\"k\": [1, 2, 3]} that's the result"
+    assert sc._extract_json(raw) == {"k": [1, 2, 3]}
+
+
+def test_extract_json_invalid_returns_falsy(sc):
+    """For totally unparseable text the function returns a falsy value
+    (currently {} via _repair_json's fallback). The pipeline then
+    rejects it via `if not plan: retry`. The contract is "falsy on
+    failure", not specifically None — keep the test honest."""
+    result = sc._extract_json("not json at all")
+    assert not result, f"expected falsy, got {result!r}"
+
+
+def test_extract_code_strips_thinking_and_fences(sc):
+    raw = (
+        "<think>plan it</think>\n"
+        "```python\n"
+        "if name == \"foo\":\n"
+        "    return \"ok\"\n"
+        "```"
+    )
+    out = sc._extract_code(raw)
+    assert "if name ==" in out
+    assert '```' not in out
+    assert 'return "ok"' in out
+
+
+def test_build_table_ddl_indents_each_table(sc):
+    plan = {
+        "tables": [
+            "CREATE TABLE workouts (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)",
+        ]
+    }
+    ddl = sc._build_table_ddl(plan)
+
+    assert ddl.count("conn.execute") == 2
+    assert "workouts" in ddl
+    assert "notes" in ddl
+
+    for line in ddl.splitlines():
+        if line.strip():
+            assert line.startswith("    "), f"DDL line not indented: {line!r}"
+
+
+def test_build_mapping_from_tools_recognises_known_ops(sc):
+    """Step 3 of the pipeline: when all tools are CRUD-style, the
+    mapping covers them and the LLM is skipped entirely."""
+    tools_list = [
+        {
+            "type": "function",
+            "function": {
+                "name": "add_note",
+                "description": "Add a new note",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string"},
+                        "body": {"type": "string"},
+                    },
+                    "required": ["title", "body"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "list_notes",
+                "description": "List all notes",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "delete_note",
+                "description": "Delete a note by id",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"id": {"type": "integer"}},
+                    "required": ["id"],
+                },
+            },
+        },
+    ]
+    plan = {"tables": ["CREATE TABLE notes (id INTEGER PRIMARY KEY, title TEXT, body TEXT)"]}
+    mapping = sc._build_mapping_from_tools(tools_list, plan)
+    assert set(mapping.keys()) == {"add_note", "list_notes", "delete_note"}
+
+    for tool, spec in mapping.items():
+        assert "op" in spec
+        assert spec["op"] in ("add", "list", "delete", "update", "get", "stats", "custom")
+
+
+def test_assemble_from_mapping_produces_valid_python(sc):
+    """The generated execute() body should be ast-parseable when wrapped."""
+    import ast
+    tools_list = [
+        {
+            "type": "function",
+            "function": {
+                "name": "add_item",
+                "parameters": {"type": "object", "properties": {"x": {"type": "string"}}},
+            },
+        },
+    ]
+    mapping = sc._build_mapping_from_tools(tools_list, {"tables": []})
+    body, has_custom, custom_tools = sc._assemble_from_mapping(mapping)
+
+    wrapped = "def execute(name, args):\n    import json, db\n    conn = db._get_conn()\n" + body
+    ast.parse(wrapped)
+
+
+def test_tools_literal_converts_json_booleans_to_python(sc):
+    """OpenAI's strict-mode function schemas use `additionalProperties:
+    false`. json.dumps emits `false`; embedding that in a Python file
+    parses fine but imports with NameError. The helper must produce
+    Python's `False` instead.
+
+    Regression: 2026-05-11 `notebooklm` skill generation failed because
+    three `"additionalProperties": false` markers landed in the rendered
+    module as bare `false` identifiers.
+    """
+    tools_list = [
+        {
+            "type": "function",
+            "function": {
+                "name": "test_tool",
+                "description": "x",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"q": {"type": "string"}},
+                    "required": [],
+                    "additionalProperties": False,
+                },
+            },
+        },
+    ]
+    rendered = sc._tools_to_python_literal(tools_list)
+
+    assert ": false" not in rendered
+    assert ": true" not in rendered
+    assert ": null" not in rendered
+
+    assert "False" in rendered
+
+
+def test_tools_literal_round_trips_through_module_import(sc, tmp_path):
+    """End-to-end pin: the rendered module must IMPORT cleanly, not
+    just `ast.parse`. The notebooklm bug bypassed ast.parse (bare
+    `false` is a valid Name node) and only blew up at import time.
+    """
+    import importlib.util
+    tools_list = [
+        {
+            "type": "function",
+            "function": {
+                "name": "foo",
+                "description": "x",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"q": {"type": "string"}},
+                    "additionalProperties": False,
+                    "required": [],
+                },
+            },
+        },
+    ]
+    rendered = sc._tools_to_python_literal(tools_list)
+    module_src = (
+        '"""test"""\n'
+        f'TOOLS = {rendered}\n'
+        'def execute(name, args): return ""\n'
+    )
+    p = tmp_path / "test_skill.py"
+    p.write_text(module_src, encoding="utf-8")
+
+    spec = importlib.util.spec_from_file_location("test_skill", p)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    assert mod.TOOLS[0]["function"]["parameters"]["additionalProperties"] is False
+
+
+def test_tools_literal_preserves_insertion_order(sc):
+    """OpenAI's function-schema spec is order-sensitive for some clients;
+    pprint.pformat with sort_dicts=False keeps dict insertion order."""
+    tools_list = [{
+        "type": "function",
+        "function": {"name": "a", "description": "x", "parameters": {"type": "object"}},
+    }]
+    rendered = sc._tools_to_python_literal(tools_list)
+    # `type` must appear before `function` in the rendered output
+    assert rendered.find("'type'") < rendered.find("'function'")
+
+
+def test_docstring_block_escapes_triple_quote(sc):
+    """A docstring containing `\"\"\"` would prematurely close the
+    rendered module docstring. The helper must escape."""
+    block = sc._docstring_block('Has """ in it')
+    assert '"""\\"\\"\\"' in block or '\\"\\"\\"' in block
+    # Result must still ast.parse as a module
+    import ast
+    ast.parse(block + '\nX = 1\n')
+
+
+def test_docstring_block_handles_trailing_backslash(sc):
+    """`text\\\\` at the end of a triple-quoted string escapes the
+    closing quote. The helper must defuse."""
+    import ast
+    block = sc._docstring_block('Has a trailing backslash\\')
+    ast.parse(block + '\nX = 1\n')
+
+
+def test_skill_template_survives_quotes_in_user_strings(sc):
+    """Regression: a planner returning `"docstring": 'Logs "important"
+    events'` used to break the rendered .py because the embedded `"`
+    closed the DESCRIPTION literal early. With repr() on the user
+    strings + _docstring_block on the docstring, rendering survives."""
+    import ast
+    code = sc.SKILL_TEMPLATE.format(
+        docstring_block=sc._docstring_block('Has " quotes'),
+        short_description_repr=repr('Quote\'s in here " too'),
+        instruction_repr=repr('Triple """ inside instruction'),
+        tools_json="[]",
+        table_ddl="    pass  # no tables",
+        execute_body="    pass  # no body",
+    )
+    ast.parse(code)
+
+
+def test_skill_template_runs_imports_cleanly(sc, tmp_path):
+    """The escape contract is import-time, not just ast-parse. Bug #2
+    from the recent fix slipped past ast.parse but failed at import.
+    Pin both layers."""
+    import ast
+    import importlib.util
+    code = sc.SKILL_TEMPLATE.format(
+        docstring_block=sc._docstring_block("normal docstring"),
+        short_description_repr=repr("Has 'mixed' \"quotes\""),
+        instruction_repr=repr("Use \"this\" tool."),
+        tools_json="[]",
+        table_ddl="    pass",
+        execute_body='    if name == "x":\n        return ""',
+    )
+    ast.parse(code)
+    p = tmp_path / "test_skill.py"
+    p.write_text(code, encoding="utf-8")
+    spec = importlib.util.spec_from_file_location("test_skill", p)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert mod.DESCRIPTION == "Has 'mixed' \"quotes\""
+    assert "Use" in mod.INSTRUCTION
+
+
+def test_extract_code_accepts_parenthesised_name_check(sc):
+    """Gemma 4B sometimes wraps: `if (name == "x"):`. The anchor
+    regex must catch it; otherwise the rest of the pipeline gets
+    garbage to indent-fix."""
+    raw = (
+        "Some preamble text.\n"
+        '```python\n'
+        'if (name == "foo"):\n'
+        '    return "ok"\n'
+        '```\n'
+    )
+    extracted = sc._extract_code(raw)
+    assert 'if (name == "foo"):' in extracted
+    assert 'return "ok"' in extracted
+
+
+def test_delete_skill_refuses_builtin(sc):
+    # mcp_manager is a built-in skill — must not be deletable
+    result = sc._delete_skill("mcp_manager")
+    assert "built-in" in result.lower() or "cannot" in result.lower()
+
+
+def test_delete_skill_invalid_identifier(sc):
+    result = sc._delete_skill("not a valid name")
+
+
+    assert isinstance(result, str)
+
+
+def test_delete_skill_missing_returns_friendly_error(sc):
+    result = sc._delete_skill("nonexistent_skill_xyz")
+    assert "not found" in result.lower()
+
+
+def test_delete_skill_drops_only_owned_namespaced_tables(sc, qwe_temp_data_dir):
+    import db
+
+    target = qwe_temp_data_dir / "skills" / "cleanup_demo.py"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        '''
+def execute(name, args):
+    conn.execute("""CREATE TABLE IF NOT EXISTS skill_cleanup_demo_items (
+        id INTEGER PRIMARY KEY,
+        body TEXT
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS skill_cleanup_demo_events (
+        id INTEGER PRIMARY KEY,
+        body TEXT
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS shared_items (
+        id INTEGER PRIMARY KEY
+    )""")
+''',
+        encoding="utf-8",
+    )
+
+    conn = db._get_conn()
+    conn.execute("CREATE TABLE skill_cleanup_demo_items (id INTEGER PRIMARY KEY)")
+    conn.execute("CREATE TABLE skill_cleanup_demo_events (id INTEGER PRIMARY KEY)")
+    conn.execute("CREATE TABLE shared_items (id INTEGER PRIMARY KEY)")
+    conn.commit()
+
+    result = sc._delete_skill("cleanup_demo")
+
+    assert "Deleted skill 'cleanup_demo'" in result
+    assert "2 skill table(s) dropped" in result
+    assert not target.exists()
+    assert conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='skill_cleanup_demo_items'"
+    ).fetchone() is None
+    assert conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='skill_cleanup_demo_events'"
+    ).fetchone() is None
+    assert conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='shared_items'"
+    ).fetchone() is not None
+
+
+def test_extract_skill_owned_tables_ignores_other_skill_prefixes(sc):
+    source = '''
+conn.execute("""CREATE TABLE IF NOT EXISTS skill_notes_data (id INTEGER)""")
+conn.execute("""CREATE TABLE IF NOT EXISTS skill_notes_archive (id INTEGER)""")
+conn.execute("""CREATE TABLE IF NOT EXISTS skill_notes2_data (id INTEGER)""")
+conn.execute("""CREATE TABLE IF NOT EXISTS notes (id INTEGER)""")
+'''
+
+    assert sc._extract_skill_owned_tables(source, "notes") == [
+        "skill_notes_archive",
+        "skill_notes_data",
+    ]
+
+
+def test_execute_unknown_tool_returns_message(sc):
+    result = sc.execute("totally_made_up_tool", {})
+    assert "Unknown tool" in result
+
+
+def test_execute_list_skill_files_returns_string(sc):
+    result = sc.execute("list_skill_files", {})
+    assert isinstance(result, str)
+
+    assert "skill_creator" in result or "no skills" in result.lower()
+
+
+def test_skill_creator_in_default_skills():
+    """skill_creator must be in the default-on set so users can use
+    create_skill without first activating anything."""
+    import skills
+    assert "skill_creator" in skills._DEFAULT_SKILLS
+
+
+def test_create_skill_listed_under_tool_search_skill_keyword():
+    """tool_search('skill') should surface create_skill."""
+    import tools
+    skill_tools = tools._TOOL_SEARCH_INDEX.get("skill", [])
+    assert "create_skill" in skill_tools
+    assert "delete_skill" in skill_tools
+    assert "list_skill_files" in skill_tools
+
+
+def test_instruction_documents_memory_api(sc):
+    assert "memory.save" in sc.INSTRUCTION
+    assert "memory.search" in sc.INSTRUCTION
+
+
+def test_instruction_documents_tools_dispatcher(sc):
+    """The cross-tool composition path — generated skills call any
+    other tool by name via tools.execute()."""
+    assert "tools.execute" in sc.INSTRUCTION
+
+    for cap in ("camera_capture", "http_request", "secret_save", "secret_get",
+                "read_file", "write_file", "send_file", "open_url"):
+        assert cap in sc.INSTRUCTION, f"{cap} missing from INSTRUCTION"
+
+
+def test_instruction_documents_llm_direct_path(sc):
+    assert "providers.get_client" in sc.INSTRUCTION
+
+
+def test_instruction_keeps_db_section(sc):
+    """Don't accidentally drop the original db API while expanding."""
+    for fn in ("db._get_conn", "db.kv_get", "db.kv_set", "db.kv_inc"):
+        assert fn in sc.INSTRUCTION, f"{fn} missing from INSTRUCTION"
+
+
+def test_step1_plan_mentions_composability(sc):
+    """The planner needs to know skills can use camera/memory/etc, or
+    it'll only output CRUD-shaped plans."""
+    assert "memory.save" in sc.STEP1_PLAN
+    assert "camera_capture" in sc.STEP1_PLAN
+    assert "http_request" in sc.STEP1_PLAN
+
+
+def test_step3_code_examples_cover_camera_memory_secret(sc):
+    """Step 3 examples train the LLM by showing the patterns. Drop one
+    and the model stops generating that pattern."""
+    assert "camera_capture" in sc.STEP3_CODE
+    assert "memory.save" in sc.STEP3_CODE
+    assert "memory.search" in sc.STEP3_CODE
+    assert "secret_get" in sc.STEP3_CODE
+    assert "http_request" in sc.STEP3_CODE
+
+
+def test_instruction_enforces_table_namespacing(sc):
+    """castor uses one shared SQLite. Without a prefix rule, two
+    user-created skills could accidentally share a `notes` table.
+    The rule must be in INSTRUCTION (LLM sees it directly) AND
+    backed by a concrete prefix example."""
+    assert "skill_<skill_name>_" in sc.INSTRUCTION
+    # An anti-example list of names the model must NOT use
+    for forbidden in ("notes", "logs", "tasks", "users"):
+        assert forbidden in sc.INSTRUCTION
+
+
+def test_step1_plan_enforces_table_namespacing(sc):
+    """The planner outputs the tables array — the prefix rule must be
+    visible there too, otherwise the planner could emit unprefixed
+    names and the downstream DDL builder propagates them as-is."""
+    assert "skill_<skill_name>_" in sc.STEP1_PLAN
+
+
+def test_extract_execute_body_finds_simple_body(sc):
+    source = '''\
+def execute(name, args):
+    val = args.get("foo")
+    return str(val)
+'''
+    body = sc._extract_execute_body(source)
+    assert 'args.get("foo")' in body
+    assert "def execute" not in body
+
+
+def test_extract_execute_body_empty_when_no_execute(sc):
+    source = '''\
+TOOLS = [{"name": "foo"}]
+def helper():
+    pass
+'''
+    body = sc._extract_execute_body(source)
+    assert body == ""
+
+
+def test_extract_execute_body_empty_when_syntax_error(sc):
+    body = sc._extract_execute_body("this is not valid python {{{")
+    assert body == ""
+
+
+def test_extract_execute_body_empty_when_empty_source(sc):
+    assert sc._extract_execute_body("") == ""
+
+
+def test_extract_execute_body_multiline_body(sc):
+    source = '''\
+TOOLS = [{"name": "test"}]
+
+def execute(name, args):
+    conn = db._get_conn()
+    val = args.get("num_samples", 30)
+    result = conn.execute("SELECT 1").fetchall()
+    return str(result)
+'''
+    body = sc._extract_execute_body(source)
+    assert 'args.get("num_samples", 30)' in body
+    assert "conn = db._get_conn()" in body
+    assert "TOOLS" not in body
+
+
+def test_smoke_test_catches_param_not_in_execute(sc, tmp_path):
+    """When a required param is in TOOLS dict but NOT used inside
+    execute(), _smoke_test should flag it (the bug this fixes)."""
+    skill_file = tmp_path / "bad_skill.py"
+    skill_file.write_text(
+        '"""A skill with mismatched param."""\n'
+        'TOOLS = [{"type": "function",\n'
+        '          "function": {"name": "do_thing",\n'
+        '                        "description": "Do a thing",\n'
+        '                        "parameters": {"type": "object",\n'
+        '                                       "properties": {"num_samples": {"type": "integer"}},\n'
+        '                                       "required": ["num_samples"]}}}]\n'
+        '\n'
+        'def execute(name, args):\n'
+        '    # Uses wrong key "samples" instead of "num_samples"\n'
+        '    val = args.get("samples", 30)\n'
+        '    return str(val)\n'
+    )
+    tools = [{"function": {"name": "do_thing",
+                           "parameters": {"type": "object",
+                                          "properties": {"num_samples": {"type": "integer"}},
+                                          "required": ["num_samples"]}}}]
+    errors = sc._smoke_test(skill_file, tools)
+    assert errors, "should have caught the param mismatch"
+    assert any("num_samples" in e for e in errors)
+
+
+def test_smoke_test_passes_when_param_used_in_execute(sc, tmp_path):
+    """When a required param IS used inside execute(), _smoke_test
+    should pass even though the param also appears in TOOLS dict."""
+    skill_file = tmp_path / "good_skill.py"
+    skill_file.write_text(
+        '"""A skill with correct param usage."""\n'
+        'TOOLS = [{"type": "function",\n'
+        '          "function": {"name": "do_thing",\n'
+        '                        "description": "Do a thing",\n'
+        '                        "parameters": {"type": "object",\n'
+        '                                       "properties": {"num_samples": {"type": "integer"}},\n'
+        '                                       "required": ["num_samples"]}}}]\n'
+        '\n'
+        'def execute(name, args):\n'
+        '    # Uses the correct key "num_samples"\n'
+        '    val = args.get("num_samples", 30)\n'
+        '    return str(val)\n'
+    )
+    tools = [{"function": {"name": "do_thing",
+                           "parameters": {"type": "object",
+                                          "properties": {"num_samples": {"type": "integer"}},
+                                          "required": ["num_samples"]}}}]
+    errors = sc._smoke_test(skill_file, tools)
+    assert not errors, f"should pass but got errors: {errors}"

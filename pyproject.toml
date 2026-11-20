@@ -1,0 +1,98 @@
+[build-system]
+requires = ["setuptools>=82.0.1", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "castor"
+version = "0.25.0"
+description = "Business-oriented AI agent — self-hosted, bring your own LLM"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [{name = "joker2still"}]
+requires-python = ">=3.11"
+dependencies = [
+    "cryptography",
+    "openai>=1.0.0",
+    "qdrant-client>=1.18.0",
+    "fastembed>=0.8.0",
+    "rich>=15.0.0",
+    "readchar>=4.2.2",
+    "fastapi>=0.110.0",
+    "python-multipart>=0.0.6",
+    "uvicorn[standard]>=0.50.0",
+    "websockets>=16.0",
+    "requests>=2.34.2",
+    "Pillow>=12.2.0",
+    "pypdf>=6.11.0",
+    "PyYAML>=6.0.3",
+    "jsonschema>=4.26.0",
+    "markitdown[docx,pptx,pdf,outlook]>=0.1.6",
+    "python-docx>=1.2.0",
+    "python-pptx>=1.0.2",
+    "openpyxl>=3.1.5",
+    "mammoth>=1.8",
+    "markdownify>=1.2.2",
+    "beautifulsoup4>=4.15.0",
+    "pdfminer.six>=20240706",
+    "yt-dlp>=2026.3.17",
+    "pyserial>=3.5",
+]
+
+[project.optional-dependencies]
+dev = ["ruff", "pytest", "pytest-cov"]
+voice = ["faster-whisper>=1.2.1"]
+anthropic_native = ["anthropic>=0.109.2"]
+
+[project.scripts]
+castor = "cli:main_entry"
+
+[tool.setuptools]
+packages = ["skills"]
+py-modules = ["cli", "agent", "agent_loop", "agent_events", "agent_budget", "coach", "commands", "config", "db", "discovery", "goal_runner", "goal_validators", "inference_setup", "logger", "mcp_client", "memory", "memory_store", "orchestrator", "plugin_registry", "presets", "pricing", "providers", "providers_anthropic", "providers_anthropic_convert", "providers_anthropic_stream", "rag", "scheduler", "secret_scrub", "server", "soul", "stt", "subagent", "synthesis", "tasks", "telegram_bot", "telemetry", "threads", "tools", "trajectory", "tts", "turn_context", "updater", "utils", "vault", "worker"]
+
+[tool.setuptools.package-data]
+"*" = ["static/**/*", "schemas/*.yaml", "migrations/*.sql"]
+
+[tool.setuptools.exclude-package-data]
+"*" = ["tests", "tests/*"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-exclude = [".venv", "build", "dist", "uploads", "memory", "wiki"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B"]
+ignore = [
+    "E501",
+    "F541",
+    "E741",
+    "E402",
+    "E701", "E702",
+    "B007", "B008", "B023", "B904",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E402", "F401", "F841", "B011"]
+
+[tool.coverage.run]
+source = ["."]
+omit = [
+    "tests/*",
+    ".venv/*",
+    "build/*",
+    "dist/*",
+    "static/*",
+    "setup.py",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+    "\\.\\.\\.",
+]
+fail_under = 24
+skip_covered = false
+show_missing = true

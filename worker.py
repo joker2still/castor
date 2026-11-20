@@ -1,0 +1,243 @@
+"""castor-worker — durable goal runner.
+
+Run as a separate process (launchd / systemd / `python -m worker`). Polls the
+``goals`` table, claims runnable goals via :func:`db.claim_next_goal`, executes
+them via :func:`goal_runner.run`, and heartbeats the lease throughout.
+
+If this process dies, the goal's ``lease_expires_at`` will lapse and another
+worker (or this same one after restart) will take over from the last
+checkpoint. See ``docs/superpowers/plans/2026-05-15-long-running-agent-architecture.md``
+for the full design.
+
+Usage::
+
+    python -m worker                  # foreground
+    python -m worker --once           # claim one goal, run it, exit (for tests)
+
+The worker is intentionally simple: it doesn't import server.py / FastAPI /
+WebSocket code, so it can run on minimal containers and doesn't tie its
+lifetime to the web UI.
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import os
+import signal
+import socket
+import sys
+import uuid
+
+import config
+import db
+import goal_runner
+import logger
+
+_log = logger.get("worker")
+
+
+WORKER_ID = f"{socket.gethostname()}_{os.getpid()}_{uuid.uuid4().hex[:6]}"
+
+
+LEASE_DURATION_SEC = 60
+HEARTBEAT_INTERVAL_SEC = 20
+
+
+_shutdown_event: asyncio.Event | None = None
+
+
+def _install_signal_handlers(loop: asyncio.AbstractEventLoop) -> None:
+    """SIGTERM / SIGINT trigger graceful shutdown — never kill-9 mid-checkpoint."""
+    assert _shutdown_event is not None
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _shutdown_event.set)
+        except NotImplementedError:
+            # Windows doesn't support add_signal_handler on the proactor loop.
+            signal.signal(sig, lambda *_: _shutdown_event.set())  # type: ignore[arg-type]
+
+
+async def _heartbeat_loop(
+    goal_id: str,
+    stop: asyncio.Event,
+    abort_on_loss: asyncio.Event | None = None,
+) -> None:
+    """Refresh the lease until *stop* is set or the goal is taken over.
+
+    When ``abort_on_loss`` is provided and the lease check finds another
+    worker has claimed the goal (or the user paused/aborted via the API
+    which clears worker_id), we set ``abort_on_loss`` so the parent task
+    can abort the in-flight orchestrator + subagent and bail out cleanly.
+    Without this signal the orchestrator would keep burning rounds for
+    up to several minutes after losing the lease.
+    """
+    while not stop.is_set():
+        try:
+            held = await asyncio.to_thread(
+                db.heartbeat_goal, goal_id, WORKER_ID, LEASE_DURATION_SEC,
+            )
+            if not held:
+                _log.warning(
+                    f"goal {goal_id} taken over (or paused/aborted by user); "
+                    f"this worker will stop processing it"
+                )
+                if abort_on_loss is not None:
+                    abort_on_loss.set()
+                stop.set()
+                return
+        except Exception:
+            _log.exception(f"heartbeat error for {goal_id}")
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=HEARTBEAT_INTERVAL_SEC)
+            return
+        except asyncio.TimeoutError:
+            continue
+
+
+async def _run_goal_with_heartbeat(goal_id: str, shutdown: asyncio.Event) -> None:
+    """Run one goal, keeping its lease alive with a parallel heartbeat task.
+
+    The goal can stop for THREE reasons, all funnelled into a single
+    per-goal asyncio.Event (``goal_stop``):
+      1. Global worker shutdown (SIGTERM, server lifespan teardown)
+      2. Heartbeat lost the lease (user paused/aborted via API, OR
+         another worker took over because we hung past lease_expires_at)
+      3. orchestrator.run_orchestrator returned normally
+
+    goal_runner receives the unified ``goal_stop`` as its shutdown_event,
+    so an in-flight subagent's threading.Event bridge fires on any of (1)
+    or (2). Without (2) wired through, a paused-via-UI goal would keep
+    burning rounds until the orchestrator finished naturally.
+    """
+    goal_stop = asyncio.Event()
+
+    async def _fanout_global_shutdown() -> None:
+        try:
+            await shutdown.wait()
+            goal_stop.set()
+        except asyncio.CancelledError:
+            return
+
+    fanout = asyncio.create_task(_fanout_global_shutdown())
+    stop_heartbeat = asyncio.Event()
+    heartbeat = asyncio.create_task(
+        _heartbeat_loop(goal_id, stop_heartbeat, abort_on_loss=goal_stop)
+    )
+    try:
+        await goal_runner.run(goal_id, shutdown_event=goal_stop)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        _log.exception(f"unhandled error running goal {goal_id}")
+    finally:
+        stop_heartbeat.set()
+        fanout.cancel()
+        try:
+            await asyncio.wait_for(heartbeat, timeout=5)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            heartbeat.cancel()
+        try:
+            await fanout
+        except (asyncio.CancelledError, Exception):
+            pass
+
+
+async def _poll_loop(once: bool = False) -> None:
+    """Main worker loop. Claims goals up to `worker_concurrency` at a time."""
+    assert _shutdown_event is not None
+
+
+    released = await asyncio.to_thread(db.release_worker_leases, WORKER_ID)
+    if released:
+        _log.info(f"released {released} stale lease(s) from previous run")
+
+    concurrency = int(config.get("worker_concurrency") or 1)
+    poll_interval = int(config.get("worker_poll_interval_sec") or 5)
+    _log.info(
+        f"worker {WORKER_ID} started "
+        f"(concurrency={concurrency}, poll={poll_interval}s, lease={LEASE_DURATION_SEC}s)"
+    )
+
+    active: set[asyncio.Task] = set()
+
+    while not _shutdown_event.is_set():
+
+        for t in {t for t in active if t.done()}:
+            active.discard(t)
+            exc = t.exception()
+            if exc and not isinstance(exc, asyncio.CancelledError):
+                _log.error(f"goal task ended with exception: {exc!r}")
+
+
+        while len(active) < concurrency and not _shutdown_event.is_set():
+            goal_id = await asyncio.to_thread(
+                db.claim_next_goal, WORKER_ID, LEASE_DURATION_SEC,
+            )
+            if not goal_id:
+                break
+            _log.info(f"claimed goal {goal_id}")
+            task = asyncio.create_task(
+                _run_goal_with_heartbeat(goal_id, _shutdown_event)
+            )
+            active.add(task)
+            if once:
+
+                break
+
+        if once and not active:
+
+            return
+        if once and active:
+
+            await asyncio.gather(*active, return_exceptions=True)
+            return
+
+
+        try:
+            await asyncio.wait_for(_shutdown_event.wait(), timeout=poll_interval)
+        except asyncio.TimeoutError:
+            pass
+
+
+    if active:
+        _log.info(f"shutdown requested; waiting for {len(active)} active goal(s)")
+        await asyncio.gather(*active, return_exceptions=True)
+    _log.info("worker stopped cleanly")
+
+
+async def _main(once: bool = False) -> None:
+    global _shutdown_event
+    _shutdown_event = asyncio.Event()
+    _install_signal_handlers(asyncio.get_running_loop())
+    await _poll_loop(once=once)
+
+
+async def start_inline(shutdown_event: asyncio.Event) -> None:
+    """Run the worker poll loop sharing the caller's event loop.
+
+    Different from _main(): doesn't install signal handlers (the host
+    process owns them) and uses the caller-provided shutdown_event so
+    server.py can wave the worker down during its own lifespan teardown.
+    The _poll_loop itself handles the startup lease cleanup.
+    """
+    global _shutdown_event
+    _shutdown_event = shutdown_event
+    await _poll_loop(once=False)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="castor durable goal worker")
+    parser.add_argument(
+        "--once", action="store_true",
+        help="claim one goal, run it, exit (for tests / dry runs)",
+    )
+    args = parser.parse_args(argv)
+    try:
+        asyncio.run(_main(once=args.once))
+        return 0
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

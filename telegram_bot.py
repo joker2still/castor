@@ -1,0 +1,2277 @@
+"""Telegram Bot integration — receive and send messages via Telegram Bot API.
+
+Uses long polling (no webhook needed). Works behind NAT, WSL, etc.
+
+Setup:
+1. Create bot via @BotFather → get token
+2. Set token via CLI (`/telegram token <TOKEN>`) or Settings → System
+3. Generate activation code in web UI or CLI
+4. Send the code to the bot in Telegram
+5. If correct → you're the verified owner
+6. If wrong → 3 attempts max, then permanent ban by Telegram user ID
+
+Security:
+- Activation codes are one-time, 6 digits, TTL 10 minutes
+- After 3 failed attempts, Telegram user ID is permanently banned
+- Only verified owner can chat; others are ignored
+
+Features:
+- Private chat with owner
+- Group support: bot responds in allowed groups
+- Supergroup topics: Telegram topic_id ↔ castor thread
+"""
+
+import atexit
+import os
+import sys
+import threading
+import time
+import json
+import random
+import string
+import requests
+from typing import Callable
+
+import db
+import logger
+import config
+
+_log = logger.get("telegram")
+
+
+_tg_tl = threading.local()
+
+
+def _push_active_ctx(ctx) -> None:
+    _tg_tl.active_ctx = ctx
+
+
+def _pop_active_ctx() -> None:
+    _tg_tl.active_ctx = None
+
+
+def pop_active_ctx():
+    """Return (and clear) the TurnContext for the current telegram request.
+
+    Called by ``server._telegram_handler`` — it uses the returned ctx to
+    route agent callbacks to this specific chat's message stream.
+    """
+    ctx = getattr(_tg_tl, "active_ctx", None)
+    _tg_tl.active_ctx = None
+    return ctx
+
+_thread: threading.Thread | None = None
+_running = False
+_on_message: Callable | None = None
+_pending_code: str | None = None
+_lock_held = False
+
+
+def _pid_alive(pid: int) -> bool:
+    """Cross-platform check whether `pid` is a live process."""
+    if pid <= 0 or pid == os.getpid():
+        return pid == os.getpid()
+    try:
+        if sys.platform == "win32":
+            import ctypes
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            h = ctypes.windll.kernel32.OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+            )
+            if not h:
+                return False
+            try:
+                exit_code = ctypes.c_ulong()
+                ctypes.windll.kernel32.GetExitCodeProcess(h, ctypes.byref(exit_code))
+                return exit_code.value == STILL_ACTIVE
+            finally:
+                ctypes.windll.kernel32.CloseHandle(h)
+        else:
+            os.kill(pid, 0)
+            return True
+    except (OSError, ProcessLookupError, PermissionError):
+        return sys.platform != "win32"
+
+
+def _lock_file_path():
+    from pathlib import Path
+    return Path(config.DATA_DIR) / "telegram.lock"
+
+
+_last_lock_held_log = 0.0
+
+
+def _acquire_lock() -> bool:
+    """Try to acquire the telegram single-instance PID lock.
+
+    Returns True iff this process now owns the lock. Clears stale locks
+    left by crashed processes. Safe to call repeatedly.
+    """
+    global _lock_held, _last_lock_held_log
+    lock_path = _lock_file_path()
+
+
+    if lock_path.exists():
+        try:
+            raw = lock_path.read_text(encoding="utf-8").strip()
+            other_pid = int(raw) if raw else 0
+        except (OSError, ValueError):
+            other_pid = 0
+        if other_pid and _pid_alive(other_pid):
+
+
+            now = time.time()
+            if now - _last_lock_held_log > 60:
+                _log.info(
+                    f"telegram lock held by PID {other_pid}; "
+                    f"not starting a second bot instance"
+                )
+                _last_lock_held_log = now
+            return False
+
+        try:
+            lock_path.unlink()
+            _log.info(f"removed stale telegram lock (PID {other_pid or '?'} not alive)")
+        except OSError:
+            pass
+
+
+    try:
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+
+
+        now = time.time()
+        if now - _last_lock_held_log > 60:
+            _log.info("telegram lock race: another instance acquired it first")
+            _last_lock_held_log = now
+        return False
+    except OSError as e:
+        _log.error(f"failed to create telegram lock at {lock_path}: {e}")
+        return False
+
+    try:
+        os.write(fd, str(os.getpid()).encode("utf-8"))
+    finally:
+        os.close(fd)
+    _lock_held = True
+    return True
+
+
+def _release_lock() -> None:
+    """Release the telegram lock if we own it. Idempotent + safe at exit."""
+    global _lock_held
+    if not _lock_held:
+        return
+    path = _lock_file_path()
+    try:
+        if path.exists():
+            raw = path.read_text(encoding="utf-8").strip()
+            if raw == str(os.getpid()):
+                path.unlink()
+    except OSError:
+        pass
+    _lock_held = False
+
+
+def get_token() -> str:
+    return db.kv_get("telegram:bot_token") or ""
+
+
+def set_token(token: str):
+    db.kv_set("telegram:bot_token", token.strip())
+
+
+def is_enabled() -> bool:
+    return db.kv_get("telegram:enabled") == "1"
+
+
+def set_enabled(enabled: bool):
+    db.kv_set("telegram:enabled", "1" if enabled else "0")
+
+
+def get_owner_id() -> int | None:
+    """Get verified owner's Telegram user ID."""
+    raw = db.kv_get("telegram:owner_id")
+    return int(raw) if raw else None
+
+
+def set_owner_id(user_id: int):
+    db.kv_set("telegram:owner_id", str(user_id))
+
+
+def get_owner_username() -> str:
+    return db.kv_get("telegram:owner_username") or ""
+
+
+def is_verified() -> bool:
+    return get_owner_id() is not None
+
+
+def _coerce_chat_id(v) -> int | None:
+    """Normalise chat-id input (str or int) into a signed int, or None."""
+    try:
+        return int(str(v).strip())
+    except (ValueError, TypeError):
+        return None
+
+
+def get_allowed_groups() -> list[int]:
+    """Get list of allowed group chat IDs as a flat list of ints.
+
+    Back-compat: older UI versions saved chat IDs as strings
+    (``["-1003803066123"]``) which made ``chat_id not in allowed_groups``
+    always true — Telegram's updates deliver ``chat_id`` as int, so the
+    "in" check never matched and bots silently ignored every group
+    message. Force int coercion on read so old data heals itself.
+    """
+    raw = db.kv_get("telegram:allowed_groups")
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return []
+    out: list[int] = []
+    for v in parsed or []:
+        iv = _coerce_chat_id(v)
+        if iv is not None:
+            out.append(iv)
+    return out
+
+
+def set_allowed_groups(group_ids) -> None:
+    """Save allowed chat IDs. Coerces str input to int, filters garbage."""
+    cleaned: list[int] = []
+    for g in group_ids or []:
+        iv = _coerce_chat_id(g)
+        if iv is not None:
+            cleaned.append(iv)
+    db.kv_set("telegram:allowed_groups", json.dumps(cleaned))
+
+
+_GROUP_MODE_ALIASES = {
+    "any": "all",
+    "disabled": "off",
+    "allowlist": "all",
+
+
+}
+
+
+def get_group_mode() -> str:
+    """How bot responds in groups.
+
+    Returns one of:
+      - "all" (default) — respond to every message in allowed groups
+      - "mention"       — respond only when @mentioned or replied to
+      - "off"           — never respond in groups
+
+    Legacy aliases ("any", "disabled", "allowlist") are normalised.
+    """
+    raw = db.kv_get("telegram:group_mode") or "all"
+    return _GROUP_MODE_ALIASES.get(raw, raw)
+
+
+def set_group_mode(mode: str):
+
+    canonical = _GROUP_MODE_ALIASES.get(mode, mode)
+    if canonical not in ("all", "mention", "off"):
+        canonical = "all"
+    db.kv_set("telegram:group_mode", canonical)
+
+
+def is_topics_enabled() -> bool:
+    """Whether to map Telegram topics to castor threads."""
+    return db.kv_get("telegram:topics_enabled") != "0"
+
+
+def set_topics_enabled(enabled: bool):
+    db.kv_set("telegram:topics_enabled", "1" if enabled else "0")
+
+
+ACTIVATION_TTL = 600
+MAX_ATTEMPTS = 3
+
+
+def generate_activation_code() -> str:
+    """Generate a 6-digit activation code (called from web UI or CLI).
+
+    Returns the code. User must send it to the bot in Telegram.
+    Code expires after 10 minutes.
+    """
+    global _pending_code
+    _pending_code = ''.join(random.choices(string.digits, k=6))
+    db.kv_set("telegram:pending_code", _pending_code)
+    db.kv_set("telegram:code_created_at", str(time.time()))
+    _log.info(f"activation code generated: {_pending_code}")
+    return _pending_code
+
+
+def get_pending_code() -> str | None:
+    """Get pending code if it exists and hasn't expired."""
+    global _pending_code
+    code = _pending_code or db.kv_get("telegram:pending_code")
+    if not code:
+        return None
+
+    created = db.kv_get("telegram:code_created_at")
+    if created:
+        age = time.time() - float(created)
+        if age > ACTIVATION_TTL:
+            _log.info(f"activation code expired (age={int(age)}s)")
+            clear_verification()
+            return None
+    return code
+
+
+def clear_verification():
+    """Clear pending activation code."""
+    global _pending_code
+    _pending_code = None
+    db.kv_set("telegram:pending_code", "")
+    db.kv_set("telegram:code_created_at", "")
+
+
+def verify_code(code: str) -> bool:
+    """Check if the provided code matches (and hasn't expired)."""
+    pending = get_pending_code()
+    return bool(pending and code.strip() == pending)
+
+
+def _ban_key(user_id: int) -> str:
+    return f"telegram:banned:{user_id}"
+
+
+def _attempts_key(user_id: int) -> str:
+    return f"telegram:attempts:{user_id}"
+
+
+def is_banned(user_id: int) -> bool:
+    """Check if a Telegram user ID is permanently banned."""
+    return db.kv_get(_ban_key(user_id)) == "1"
+
+
+def ban_user(user_id: int):
+    """Permanently ban a Telegram user ID."""
+    db.kv_set(_ban_key(user_id), "1")
+    _log.warning(f"permanently banned user {user_id}")
+
+
+def get_attempts(user_id: int) -> int:
+    """Get number of failed activation attempts for a user."""
+    raw = db.kv_get(_attempts_key(user_id))
+    return int(raw) if raw else 0
+
+
+def increment_attempts(user_id: int) -> int:
+    """Increment failed attempts. Returns new count. Bans if >= MAX_ATTEMPTS."""
+    count = get_attempts(user_id) + 1
+    db.kv_set(_attempts_key(user_id), str(count))
+    if count >= MAX_ATTEMPTS:
+        ban_user(user_id)
+    return count
+
+
+def clear_attempts(user_id: int):
+    """Clear failed attempt counter (after successful verification)."""
+    db.kv_set(_attempts_key(user_id), "0")
+
+
+def _topic_thread_key(chat_id: int, topic_id: int) -> str:
+    return f"telegram:topic_thread:{chat_id}:{topic_id}"
+
+
+def get_thread_for_topic(chat_id: int, topic_id: int) -> str | None:
+    """Get castor thread_id for a Telegram topic."""
+    return db.kv_get(_topic_thread_key(chat_id, topic_id))
+
+
+def set_thread_for_topic(chat_id: int, topic_id: int, thread_id: str):
+    """Map a Telegram topic to a castor thread."""
+    db.kv_set(_topic_thread_key(chat_id, topic_id), thread_id)
+
+
+def _get_or_create_thread_for_topic(chat_id: int, topic_id: int, topic_name: str = "") -> str:
+    """Get existing thread or create new one for a Telegram topic."""
+    import threads
+    tid = get_thread_for_topic(chat_id, topic_id)
+    if tid:
+        t = threads.get(tid)
+        if t:
+            return tid
+
+    name = topic_name or f"TG Topic #{topic_id}"
+    t = threads.create(name, meta={"telegram_chat_id": chat_id, "telegram_topic_id": topic_id}, source="telegram")
+    set_thread_for_topic(chat_id, topic_id, t["id"])
+    _log.info(f"created thread '{name}' ({t['id']}) for topic {topic_id} in chat {chat_id}")
+    return t["id"]
+
+
+def _get_or_create_dm_thread(chat_id: int) -> str:
+    """Get or create a dedicated thread for Telegram DM (private chat).
+    This ensures Telegram private messages never mix with web UI threads."""
+    import threads
+    kv_key = f"telegram:dm_thread:{chat_id}"
+    tid = db.kv_get(kv_key)
+    if tid:
+        t = threads.get(tid)
+        if t:
+            return tid
+
+    t = threads.create("Telegram DM", meta={"telegram_chat_id": chat_id, "telegram_dm": True}, source="telegram")
+    db.kv_set(kv_key, t["id"])
+    _log.info(f"created DM thread ({t['id']}) for chat {chat_id}")
+    return t["id"]
+
+
+def _api(method: str, token: str, **kwargs) -> dict:
+    """Call Telegram Bot API."""
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    try:
+        r = requests.post(url, json=kwargs, timeout=60)
+        return r.json()
+    except Exception as e:
+        _log.error(f"API error: {method} → {e}")
+        return {"ok": False, "description": str(e)}
+
+
+def _method_unsupported(result: dict) -> bool:
+    """True when an ``_api`` result means the METHOD itself is unavailable on
+    this Bot API version — NOT a content-level rejection.
+
+    Telegram answers HTTP 404 ``Not Found`` for an unknown method; content
+    errors are 400 ``Bad Request: <reason>`` (e.g. ``chat not found``,
+    ``message to edit not found``). The distinction matters: a bare
+    ``"not found" in description`` substring test wrongly latches a feature
+    OFF after a single bad ``chat_id`` — disabling rich messages / drafts for
+    the whole process. Match the 404 status (or the exact ``"not found"``
+    method-missing description), never the substring.
+    """
+    if result.get("error_code") == 404:
+        return True
+    desc = (result.get("description") or "").strip().lower()
+
+
+    return desc == "not found" or "unknown method" in desc or "method not found" in desc
+
+
+import commands as _commands_registry
+
+
+def get_commands() -> list[dict]:
+    """Get all Telegram-exposed commands for the Telegram API.
+
+    Reads from the central registry filtered by ``surface="tg"``.
+    Output shape matches Telegram's setMyCommands payload exactly.
+    """
+    return [
+        {"command": c.name, "description": c.description[:256]}
+        for c in _commands_registry.for_surface("tg")
+    ]
+
+
+def _register_commands(token: str):
+    """Push the Telegram-exposed commands to BotFather for predictive input."""
+    cmds = get_commands()
+    result = _api("setMyCommands", token, commands=cmds)
+    if result.get("ok"):
+        _log.info(f"registered {len(cmds)} slash commands from central registry")
+    else:
+        _log.warning(f"failed to register commands: {result}")
+
+
+def _handle_bot_command(cmd: str, args: str, chat_id: int, user_id: int,
+                        token: str, topic_id: int | None = None,
+                        thread_id: str | None = None) -> bool:
+    """Handle built-in bot commands. Returns True if handled."""
+    import providers
+    import soul
+    import skills
+    import threads as thr
+
+    if cmd == "chatid":
+        info = f"📋 Chat ID: `{chat_id}`"
+        if topic_id:
+            info += f"\nTopic ID: `{topic_id}`"
+        send_message(chat_id, info, token, topic_id=topic_id)
+        return True
+
+    if cmd == "status":
+        s = soul.load()
+        model = providers.get_model()
+        prov = providers.get_active_name()
+        active_skills = skills.get_active()
+        import memory as mem
+        mem_count = 0
+        try:
+            mem_count = mem.count()
+        except Exception:
+            pass
+        msg = (
+            f"⚡ *{s['name']}*\n"
+            f"Model: `{model}` @ {prov}\n"
+            f"Skills: {', '.join(sorted(active_skills)) or 'none'}\n"
+            f"Memories: {mem_count}"
+        )
+        send_message(chat_id, msg, token, topic_id=topic_id)
+        return True
+
+    if cmd == "soul":
+        s = soul.load()
+        lines = [f"🎭 *{s.get('name', 'Agent')}* ({s.get('language', '?')})"]
+        for k, v in s.items():
+            if k not in ("name", "language"):
+                lines.append(f"  {k}: {v}")
+        send_message(chat_id, "\n".join(lines), token, topic_id=topic_id)
+        return True
+
+    if cmd == "model":
+        model = providers.get_model()
+        prov = providers.get_active_name()
+        send_message(chat_id, f"🤖 Model: `{model}`\nProvider: {prov}", token, topic_id=topic_id)
+        return True
+
+    if cmd == "skills":
+        active = skills.get_active()
+        all_skills = skills.list_all()
+        lines = []
+        for s in all_skills:
+            mark = "✅" if s["name"] in active else "◻️"
+            lines.append(f"{mark} {s['name']}")
+        send_message(chat_id, "🧩 *Skills*\n" + "\n".join(lines), token, topic_id=topic_id)
+        return True
+
+    if cmd == "memory":
+        if not args:
+            send_message(chat_id, "Usage: `/memory <query>`", token, topic_id=topic_id)
+            return True
+        import memory as mem
+        results = mem.search(args, limit=3)
+        if results:
+            lines = ["🧠 *Memory search:*"]
+            for r in results:
+                text = r.get("text", "")[:200]
+                score = r.get("score", 0)
+                lines.append(f"• ({score:.2f}) {text}")
+            send_message(chat_id, "\n".join(lines), token, topic_id=topic_id)
+        else:
+            send_message(chat_id, "Nothing found.", token, topic_id=topic_id)
+        return True
+
+    if cmd == "threads":
+        all_t = thr.list_all()
+        active_id = thr.get_active_id()
+        lines = ["🧵 *Threads:*"]
+        for t in all_t[:10]:
+            mark = "→" if t["id"] == (thread_id or active_id) else " "
+            lines.append(f"{mark} {t['name']} ({t['messages']} msgs)")
+        send_message(chat_id, "\n".join(lines), token, topic_id=topic_id)
+        return True
+
+    if cmd == "stats":
+        import db as _db
+        turns = _db.kv_get("session_turns") or "0"
+        prompt_t = int(_db.kv_get("session_prompt_tokens") or "0")
+        compl_t = int(_db.kv_get("session_completion_tokens") or "0")
+        msg = (
+            f"📊 *Stats*\n"
+            f"Turns: {turns}\n"
+            f"Tokens: {prompt_t + compl_t} (prompt: {prompt_t}, completion: {compl_t})"
+        )
+        send_message(chat_id, msg, token, topic_id=topic_id)
+        return True
+
+    if cmd == "clear":
+        import db as _db
+        _db.clear_history(thread_id=thread_id)
+        send_message(chat_id, "🗑 History cleared for this thread.", token, topic_id=topic_id)
+        return True
+
+    if cmd == "profile":
+        if args and args.startswith("set "):
+
+            set_parts = args[4:].strip().split(None, 1)
+            if len(set_parts) == 2:
+                key = set_parts[0].strip().lower().replace(" ", "_")
+                val = set_parts[1].strip()
+                db.kv_set(f"user:{key}", val)
+                send_message(chat_id, f"✅ Profile: `{key}` = {val}", token, topic_id=topic_id)
+            else:
+                send_message(chat_id, "Usage: `/profile set <key> <value>`", token, topic_id=topic_id)
+        else:
+            profile = db.kv_get_prefix("user:")
+            if not profile:
+                send_message(chat_id, "👤 No profile data yet.\n\nSet with: `/profile set name John`", token, topic_id=topic_id)
+            else:
+                lines = ["👤 *Profile:*"]
+                for k, v in sorted(profile.items()):
+                    lines.append(f"• {k.replace('user:', '')}: {v}")
+                lines.append(f"\nEdit: `/profile set <key> <value>`")
+                send_message(chat_id, "\n".join(lines), token, topic_id=topic_id)
+        return True
+
+    if cmd == "heartbeat":
+        import scheduler
+        if not args:
+
+            enabled = db.kv_get("heartbeat:enabled") != "0"
+            raw = db.kv_get("heartbeat:items")
+            items = json.loads(raw) if raw else []
+            status_icon = "🟢" if enabled else "⚪"
+            lines = [f"{status_icon} *Heartbeat* {'ON' if enabled else 'OFF'}"]
+            if items:
+                for i, item in enumerate(items, 1):
+                    lines.append(f"  {i}. {item}")
+            else:
+                lines.append("  No items yet.")
+            lines.append(f"\n`/heartbeat add <task>`\n`/heartbeat remove <N>`\n`/heartbeat on` / `off`")
+            send_message(chat_id, "\n".join(lines), token, topic_id=topic_id)
+        elif args.startswith("add "):
+            task_text = args[4:].strip().strip('"').strip("'")
+            if not task_text:
+                send_message(chat_id, "Usage: `/heartbeat add <task>`", token, topic_id=topic_id)
+            else:
+                raw = db.kv_get("heartbeat:items")
+                items = json.loads(raw) if raw else []
+                items.append(task_text)
+                db.kv_set("heartbeat:items", json.dumps(items))
+                send_message(chat_id, f"✅ Added: {task_text}", token, topic_id=topic_id)
+        elif args.startswith("remove "):
+            try:
+                idx = int(args[7:].strip()) - 1
+                raw = db.kv_get("heartbeat:items")
+                items = json.loads(raw) if raw else []
+                if 0 <= idx < len(items):
+                    removed = items.pop(idx)
+                    db.kv_set("heartbeat:items", json.dumps(items))
+                    send_message(chat_id, f"✅ Removed: {removed}", token, topic_id=topic_id)
+                else:
+                    send_message(chat_id, f"Invalid index. Use `/heartbeat` to see items.", token, topic_id=topic_id)
+            except ValueError:
+                send_message(chat_id, "Usage: `/heartbeat remove <number>`", token, topic_id=topic_id)
+        elif args.strip() == "on":
+            db.kv_set("heartbeat:enabled", "1")
+            scheduler._register_heartbeat()
+            interval = config.get("heartbeat_interval_min")
+            send_message(chat_id, f"🟢 Heartbeat ON (every {interval}m)", token, topic_id=topic_id)
+        elif args.strip() == "off":
+            db.kv_set("heartbeat:enabled", "0")
+            scheduler._unregister_heartbeat()
+            send_message(chat_id, "⚪ Heartbeat OFF", token, topic_id=topic_id)
+        else:
+            send_message(chat_id, "Usage: `/heartbeat`, `add <task>`, `remove <N>`, `on`, `off`", token, topic_id=topic_id)
+        return True
+
+    if cmd == "settings":
+        parts = args.split(None, 1) if args else []
+        if len(parts) == 2:
+
+            key, val = parts
+            result = config.set(key, val)
+            send_message(chat_id, result, token, topic_id=topic_id)
+        else:
+
+            all_s = config.get_all()
+            lines = ["⚙️ **Settings:**\n"]
+            for k, info in all_s.items():
+                v = info["value"]
+                d = info["default"]
+                marker = "" if v == d else " *(modified)*"
+                lines.append(f"• `{k}` = **{v}**{marker}")
+                lines.append(f"  _{info['description']}_ ({info['min']}-{info['max']})")
+            lines.append(f"\nEdit: `/settings <key> <value>`")
+            send_message(chat_id, "\n".join(lines), token, topic_id=topic_id)
+        return True
+
+    if cmd == "cron":
+        import scheduler
+        tasks_list = scheduler.list_tasks()
+        if not tasks_list:
+            send_message(chat_id, "📋 No scheduled tasks.\n\nAsk me to schedule something, e.g.:\n_\"Remind me to stretch every 2h\"_", token, topic_id=topic_id)
+            return True
+        lines = ["📋 **Scheduled tasks:**\n"]
+        for t in tasks_list:
+            status = "🟢" if t["enabled"] else "⚪"
+            repeat = "🔄" if t["repeat"] else "⏱"
+            lines.append(f"{status} #{t['id']} {repeat} **{t['name']}**")
+            lines.append(f"    → {t['next_run']} ({t['schedule']})")
+            lines.append(f"    _{t['task'][:80]}_")
+        send_message(chat_id, "\n".join(lines), token, topic_id=topic_id)
+        return True
+
+    if cmd == "voice":
+        key = f"voice_mode:{chat_id}"
+        current = db.kv_get(key) == "1"
+        new_val = not current
+        import tts
+        if new_val and not tts.is_available():
+            send_message(chat_id, "TTS not available.\n\ntts_enabled = " + str(config.get("tts_enabled")) + "\ntts_api_url = " + (config.get("tts_api_url") or "(empty)") + "\n\nEnable TTS and set API URL in Settings → Voice.", token, topic_id=topic_id)
+            return True
+        db.kv_set(key, "1" if new_val else "0")
+        if new_val:
+            send_message(chat_id, "Voice mode ON\nAll responses will include voice.", token, topic_id=topic_id)
+        else:
+            send_message(chat_id, "Voice mode OFF\nText-only responses.", token, topic_id=topic_id)
+        return True
+
+    if cmd == "thinking":
+        current = db.kv_get("thinking_enabled") == "true"
+        new_val = not current
+        db.kv_set("thinking_enabled", "true" if new_val else "false")
+        status_text = "💭 Thinking: **ON**\nModel will reason before responding" if new_val else "💭 Thinking: **OFF**\nFast responses without reasoning"
+        send_message(chat_id, status_text, token, topic_id=topic_id)
+        return True
+
+    if cmd == "doctor":
+        send_message(chat_id, "🔍 Running diagnostics...", token, topic_id=topic_id)
+        import threading
+
+        def _run_doctor():
+            results = _run_doctor_checks()
+            send_message(chat_id, results, token, topic_id=topic_id)
+
+        threading.Thread(target=_run_doctor, daemon=True).start()
+        return True
+
+    if cmd == "resume":
+        tgt_thread = thread_id or (
+            _get_or_create_dm_thread(chat_id) if not topic_id
+            else _get_or_create_thread_for_topic(chat_id, topic_id)
+        )
+        try:
+            ttl = float(config.get("resume_ttl_telegram_sec") or 86400)
+        except Exception:
+            ttl = 86400
+        row = db.get_resumable_run_for_thread(
+            tgt_thread, source_filter="telegram", ttl_sec=ttl
+        )
+        if not row:
+            send_message(chat_id, "No interrupted task to resume.", token,
+                         topic_id=topic_id)
+            return True
+        send_message(chat_id, "Resuming previous task...", token, topic_id=topic_id)
+
+        def _do_resume():
+            import agent as _agent_mod
+            try:
+                _agent_mod.resume_interrupted_run(row["id"])
+            except Exception as exc:
+                _log.warning(f"telegram /resume failed for run #{row['id']}: {exc}")
+                send_message(chat_id, f"Resume failed: {str(exc)[:200]}", token,
+                             topic_id=topic_id)
+
+        threading.Thread(target=_do_resume, daemon=True).start()
+        return True
+
+    if cmd == "help":
+
+
+        lines = ["📖 *Commands:*"]
+        by_cat = _commands_registry.categories_for("tg")
+        for category, cmds in by_cat.items():
+            lines.append(f"\n_{category}_")
+            for c in cmds:
+                hint = f" {c.args_hint}" if c.args_hint else ""
+                lines.append(f"/{c.name}{hint} — {c.description}")
+        send_message(chat_id, "\n".join(lines), token, topic_id=topic_id)
+        return True
+
+    return False
+
+
+def _iter_blockquote_groups(lines: list[str], marker: str):
+    """Yield ``(is_quote, is_expandable, content_lines)`` runs over ``lines``.
+
+    A quote line starts with ``marker`` (``"&gt;"`` for the HTML pass — the
+    leading ``>`` is already entity-escaped — or ``"\\>"`` for MarkdownV2,
+    where the escaper has backslash-escaped the ``>``). A run whose FIRST
+    line carries an extra ``!`` right after the marker is expandable.
+    Consecutive quote lines are coalesced into a single group so they render
+    as one ``<blockquote>`` / one collapsible block rather than N stacked
+    ones. The marker (and one optional following space) is stripped from
+    each returned content line.
+    """
+    expand_marker = marker + ("!" if "\\" not in marker else "\\!")
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+        if line.startswith(marker):
+            expandable = line.startswith(expand_marker)
+            content = []
+            while i < n and lines[i].startswith(marker):
+                ln = lines[i]
+
+                if ln.startswith(expand_marker):
+                    ln = ln[len(expand_marker):]
+                else:
+                    ln = ln[len(marker):]
+                if ln.startswith(" "):
+                    ln = ln[1:]
+                content.append(ln)
+                i += 1
+            yield (True, expandable, content)
+        else:
+            yield (False, False, [line])
+            i += 1
+
+
+def _html_render_blockquotes(text: str) -> str:
+    """Wrap consecutive ``&gt;``-prefixed lines in one ``<blockquote>`` (or
+    ``<blockquote expandable>`` when the run opens with ``&gt;!``)."""
+    out = []
+    for is_quote, expandable, content in _iter_blockquote_groups(text.split("\n"), "&gt;"):
+        if not is_quote:
+            out.append(content[0])
+            continue
+        body = "\n".join(content)
+        if expandable:
+            out.append(f"<blockquote expandable>{body}</blockquote>")
+        else:
+            out.append(f"<blockquote>{body}</blockquote>")
+    return "\n".join(out)
+
+
+import re as _re_mod
+
+
+_TG_HTML_TAGS = "b|strong|i|em|u|ins|s|strike|del|code|pre|a|tg-spoiler|tg-emoji|blockquote|span"
+_HTML_CLOSE_RE = _re_mod.compile(rf"</(?:{_TG_HTML_TAGS})>", _re_mod.IGNORECASE)
+
+
+def _looks_like_html(text: str) -> bool:
+    """True if ``text`` already contains Telegram-style HTML markup (detected
+    by a closing tag for one of the supported entities). Used to send the
+    agent's reply with parse_mode=HTML verbatim instead of mangling it."""
+    return bool(_HTML_CLOSE_RE.search(text or ""))
+
+
+def _md2_render_blockquotes(text: str) -> str:
+    """Un-escape line-leading ``\\>`` quote markers in already-escaped
+    MarkdownV2, grouping consecutive quote lines. A run opening with
+    ``\\>\\!`` becomes an expandable quote (``**>`` first line, trailing
+    ``||`` after the last)."""
+    out = []
+    for is_quote, expandable, content in _iter_blockquote_groups(text.split("\n"), "\\>"):
+        if not is_quote:
+            out.append(content[0])
+            continue
+        if expandable:
+            quoted = [("**>" if j == 0 else ">") + c for j, c in enumerate(content)]
+            quoted[-1] = quoted[-1] + "||"
+            out.append("\n".join(quoted))
+        else:
+            out.append("\n".join(">" + c for c in content))
+    return "\n".join(out)
+
+
+def _to_html(text: str) -> str:
+    """Convert standard Markdown to Telegram HTML format.
+
+    More reliable than MarkdownV2 for complex content with code blocks.
+    """
+    import re as _re
+    import html as _html
+
+
+    protected = []
+    counter = [0]
+
+    def _protect(match):
+        idx = counter[0]
+        counter[0] += 1
+        protected.append(match.group(0))
+        return f"\x00HTML{idx}\x00"
+
+
+    result = _re.sub(r'```(\w*)\n([\s\S]*?)```', _protect, text)
+    result = _re.sub(r'`([^`]+)`', _protect, result)
+
+
+    result = _html.escape(result)
+
+
+    result = _re.sub(
+        r'!\[([^\]]+)\]\(tg://emoji\?id=(\d+)\)',
+        r'<tg-emoji emoji-id="\2">\1</tg-emoji>',
+        result,
+    )
+
+
+    result = _re.sub(r'~~([^~]+)~~', r'<s>\1</s>', result)
+
+    result = _re.sub(r'\|\|([^|]+)\|\|', r'<tg-spoiler>\1</tg-spoiler>', result)
+
+    result = _re.sub(r'\*\*([^*]+)\*\*', r'<b>\1</b>', result)
+
+
+    result = _re.sub(r'__([^_]+)__', r'<u>\1</u>', result)
+
+    result = _re.sub(r'\*([^*]+)\*', r'<i>\1</i>', result)
+    result = _re.sub(r'(?<!\w)_([^_]+)_(?!\w)', r'<i>\1</i>', result)
+
+    result = _re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<a href="\2">\1</a>', result)
+
+
+    result = _html_render_blockquotes(result)
+
+
+    for i, p in enumerate(protected):
+        if p.startswith('```'):
+
+            m = _re.match(r'```(\w*)\n([\s\S]*?)```', p)
+            if m:
+                lang = m.group(1)
+                code = _html.escape(m.group(2).rstrip())
+                if lang:
+                    replacement = f'<pre><code class="language-{lang}">{code}</code></pre>'
+                else:
+                    replacement = f'<pre><code>{code}</code></pre>'
+            else:
+                replacement = _html.escape(p)
+        elif p.startswith('`'):
+
+            code = _html.escape(p.strip('`'))
+            replacement = f'<code>{code}</code>'
+        else:
+            replacement = _html.escape(p)
+        result = result.replace(f"\x00HTML{i}\x00", replacement)
+
+    return result
+
+
+def _to_markdownv2(text: str) -> str:
+    """Convert standard Markdown to Telegram MarkdownV2.
+
+    Handles: **bold**, *italic*, `code`, ```codeblocks```, [links](url)
+    Escapes special chars outside of formatted regions.
+    """
+    import re as _re
+
+
+    protected = []
+    counter = [0]
+
+    def _protect(match):
+        idx = counter[0]
+        counter[0] += 1
+        protected.append(match.group(0))
+        return f"\x00PROTECTED{idx}\x00"
+
+
+    result = _re.sub(r'```[\s\S]*?```', _protect, text)
+    result = _re.sub(r'`[^`]+`', _protect, result)
+
+
+    bold_parts = []
+    def _protect_bold(m):
+        idx = len(bold_parts)
+        bold_parts.append(m.group(1))
+        return f"\x01BOLD{idx}\x01"
+
+    italic_parts = []
+    def _protect_italic(m):
+        idx = len(italic_parts)
+        italic_parts.append(m.group(1))
+        return f"\x02ITALIC{idx}\x02"
+
+
+    emoji_parts = []
+    def _protect_emoji(m):
+        idx = len(emoji_parts)
+        emoji_parts.append(m.group(0))
+        return f"\x05EMOJI{idx}\x05"
+
+    result = _re.sub(r'!\[[^\]]+\]\(tg://emoji\?id=\d+\)', _protect_emoji, result)
+
+
+    link_parts = []
+    def _protect_link(m):
+        idx = len(link_parts)
+        link_parts.append((m.group(1), m.group(2)))
+        return f"\x03LINK{idx}\x03"
+
+    result = _re.sub(r'\[([^\]]+)\]\(([^)]+)\)', _protect_link, result)
+
+
+    strike_parts = []
+    def _protect_strike(m):
+        idx = len(strike_parts)
+        strike_parts.append(m.group(1))
+        return f"\x04STRIKE{idx}\x04"
+
+    result = _re.sub(r'~~([^~]+)~~', _protect_strike, result)
+
+
+    spoiler_parts = []
+    def _protect_spoiler(m):
+        idx = len(spoiler_parts)
+        spoiler_parts.append(m.group(1))
+        return f"\x06SPOILER{idx}\x06"
+
+    result = _re.sub(r'\|\|([^|]+)\|\|', _protect_spoiler, result)
+
+
+    underline_parts = []
+    def _protect_underline(m):
+        idx = len(underline_parts)
+        underline_parts.append(m.group(1))
+        return f"\x07UNDER{idx}\x07"
+
+    result = _re.sub(r'__([^_]+)__', _protect_underline, result)
+
+    result = _re.sub(r'\*\*([^*]+)\*\*', _protect_bold, result)
+
+    result = _re.sub(r'\*([^*]+)\*', _protect_italic, result)
+    result = _re.sub(r'(?<!\w)_([^_]+)_(?!\w)', _protect_italic, result)
+
+
+    special = r'_[]()~>#+-=|{}.!'
+    escaped = ""
+    for ch in result:
+        if ch in special:
+            escaped += "\\" + ch
+        else:
+            escaped += ch
+    result = escaped
+
+
+    for i, b in enumerate(bold_parts):
+        esc_b = ""
+        for ch in b:
+            if ch in special:
+                esc_b += "\\" + ch
+            else:
+                esc_b += ch
+        result = result.replace(f"\x01BOLD{i}\x01", f"*{esc_b}*")
+
+
+    for i, it in enumerate(italic_parts):
+        esc_it = ""
+        for ch in it:
+            if ch in special:
+                esc_it += "\\" + ch
+            else:
+                esc_it += ch
+        result = result.replace(f"\x02ITALIC{i}\x02", f"_{esc_it}_")
+
+
+    for i, s in enumerate(strike_parts):
+        esc_s = ""
+        for ch in s:
+            if ch in special:
+                esc_s += "\\" + ch
+            else:
+                esc_s += ch
+        result = result.replace(f"\x04STRIKE{i}\x04", f"~{esc_s}~")
+
+
+    for i, sp in enumerate(spoiler_parts):
+        esc_sp = ""
+        for ch in sp:
+            if ch in special:
+                esc_sp += "\\" + ch
+            else:
+                esc_sp += ch
+        result = result.replace(f"\x06SPOILER{i}\x06", f"||{esc_sp}||")
+
+
+    for i, u in enumerate(underline_parts):
+        esc_u = ""
+        for ch in u:
+            if ch in special:
+                esc_u += "\\" + ch
+            else:
+                esc_u += ch
+        result = result.replace(f"\x07UNDER{i}\x07", f"__{esc_u}__")
+
+
+    for i, (link_text, link_url) in enumerate(link_parts):
+        esc_lt = ""
+        for ch in link_text:
+            if ch in special:
+                esc_lt += "\\" + ch
+            else:
+                esc_lt += ch
+
+        esc_url = link_url.replace("\\", "\\\\").replace(")", "\\)")
+        result = result.replace(f"\x03LINK{i}\x03", f"[{esc_lt}]({esc_url})")
+
+    # Restore custom emoji verbatim (markup must stay unescaped)
+    for i, e in enumerate(emoji_parts):
+        result = result.replace(f"\x05EMOJI{i}\x05", e)
+
+
+    for i, p in enumerate(protected):
+        result = result.replace(f"\x00PROTECTED{i}\x00", p)
+
+
+    result = _md2_render_blockquotes(result)
+
+    return result
+
+
+def _run_doctor_checks() -> str:
+    """Run all diagnostics, return formatted string for Telegram."""
+    import time as _time
+    import config
+    import providers
+    import memory as mem
+    import skills
+    import threads
+    import db as _db
+
+    lines = ["⚡ *castor doctor*\n"]
+    passed = failed = warns = 0
+
+    def ok(name, msg=""):
+        nonlocal passed; passed += 1
+        lines.append(f"✅ {name}: {msg}" if msg else f"✅ {name}")
+    def warn(name, msg=""):
+        nonlocal warns; warns += 1
+        lines.append(f"⚠️ {name}: {msg}" if msg else f"⚠️ {name}")
+    def fail(name, msg=""):
+        nonlocal failed; failed += 1
+        lines.append(f"❌ {name}: {msg}" if msg else f"❌ {name}")
+
+
+    try:
+        msg_count = _db.fetchone("SELECT COUNT(*) FROM messages")[0]
+        ok("SQLite", f"{msg_count} messages")
+    except Exception as e:
+        fail("SQLite", str(e)[:60])
+
+
+    try:
+        count = mem.count()
+        ok("Qdrant", f"{count} memories")
+    except Exception as e:
+        fail("Qdrant", str(e)[:60])
+
+
+    try:
+        import requests as _req
+        url = providers.get_url().rstrip("/")
+        r = _req.get(f"{url}/models", timeout=5)
+        if r.ok:
+            models = [m["id"] for m in r.json().get("data", [])]
+            ok("LLM API", f"{len(models)} models")
+        else:
+            fail("LLM API", f"HTTP {r.status_code}")
+    except Exception as e:
+        fail("LLM API", str(e)[:60])
+
+
+    try:
+        active = providers.get_active_name()
+        model = providers.get_model()
+        if active in ("lmstudio", "ollama"):
+            import requests as _req
+            api_base = providers.get_url().rstrip("/").replace("/v1", "")
+            r = _req.get(f"{api_base}/api/v1/models", timeout=5)
+            if r.ok:
+                loaded = any(
+                    m.get("key") == model and m.get("loaded_instances")
+                    for m in r.json().get("models", [])
+                )
+                if loaded:
+                    ok("Model", f"`{model}` loaded")
+                else:
+                    warn("Model", f"`{model}` not loaded (auto-loads on use)")
+            else:
+                warn("Model", "could not check")
+        else:
+            ok("Model", f"`{model}` @ {active}")
+    except Exception as e:
+        warn("Model", str(e)[:60])
+
+
+    try:
+        import memory
+        vec = memory.embed("test")
+        ok("Embeddings", f"FastEmbed `{memory.DENSE_MODEL_NAME}` ({len(vec)}d)")
+    except Exception as e:
+        fail("Embeddings", str(e)[:60])
+
+
+    try:
+        providers.ensure_model_loaded()
+        client = providers.get_client()
+        t0 = _time.time()
+        resp = client.chat.completions.create(
+            model=providers.get_model(),
+            messages=[{"role": "user", "content": "Say 'ok'"}],
+            max_tokens=10, temperature=0,
+        )
+        elapsed = _time.time() - t0
+        reply = (resp.choices[0].message.content or "").strip()[:20]
+        ok("Inference", f"'{reply}' in {elapsed:.1f}s")
+    except Exception as e:
+        fail("Inference", str(e)[:60])
+
+
+    s = status()
+    if s["verified"]:
+        ok("Telegram", f"@{s['username']}")
+    elif s["running"]:
+        warn("Telegram", "running but not verified")
+    elif s["has_token"]:
+        warn("Telegram", "not running")
+    else:
+        warn("Telegram", "no token")
+
+
+    all_t = threads.list_all()
+    ok("Threads", f"{len(all_t)}")
+    active_skills = skills.get_active()
+    ok("Skills", f"{len(active_skills)} active")
+
+
+    try:
+        import scheduler
+        tasks = scheduler.list_tasks()
+        ok("Cron", f"{len(tasks)} tasks")
+    except Exception:
+        warn("Cron", "scheduler not available")
+
+    hb_enabled = _db.kv_get("heartbeat:enabled") != "0"
+    raw = _db.kv_get("heartbeat:items")
+    import json as _json
+    hb_items = _json.loads(raw) if raw else []
+    ok("Heartbeat", f"{'ON' if hb_enabled else 'OFF'}, {len(hb_items)} items")
+
+
+    try:
+        import stt
+        if stt._check_faster_whisper():
+            import shutil
+            if shutil.which("ffmpeg"):
+                ok("STT", f"whisper + ffmpeg (model: {config.get('stt_model')})")
+            else:
+                warn("STT", "faster-whisper OK, ffmpeg missing")
+        else:
+            warn("STT", "faster-whisper not installed")
+    except Exception:
+        warn("STT", "module not available")
+
+    try:
+        import tts
+        if tts.is_available():
+            url = config.get("tts_api_url") or ""
+            import requests as _req2
+            try:
+                _req2.get(url, timeout=3)
+                ok("TTS", f"server reachable at {url}")
+            except Exception:
+                warn("TTS", f"server unreachable at {url}")
+        elif str(config.get("tts_enabled")) != "1":
+            warn("TTS", "disabled")
+        else:
+            warn("TTS", "no API URL configured")
+    except Exception:
+        warn("TTS", "module not available")
+
+
+    try:
+        rag_count = _db.fetchone("SELECT COUNT(*) FROM fts_rag")[0]
+        mem_count = _db.fetchone("SELECT COUNT(*) FROM fts_memory")[0]
+        ok("BM25", f"{rag_count} rag + {mem_count} memory entries")
+    except Exception:
+        warn("BM25", "FTS5 tables not found")
+
+
+    try:
+        import rag
+        stats = rag.stats()
+        ok("RAG", f"{stats.get('total_chunks', 0)} chunks, {stats.get('total_files', 0)} files")
+    except Exception:
+        warn("RAG", "not available")
+
+
+    try:
+        import shutil
+        _, _, free = shutil.disk_usage(".")
+        free_gb = free / (1024**3)
+        if free_gb < 1:
+            warn("Disk", f"{free_gb:.1f}GB free")
+        else:
+            ok("Disk", f"{free_gb:.1f}GB free")
+    except Exception:
+        warn("Disk", "unknown")
+
+
+    total = passed + failed + warns
+    lines.append("")
+    if failed == 0 and warns == 0:
+        lines.append(f"*All {total} checks passed!* ⚡")
+    else:
+        lines.append(f"*{passed}* passed, *{failed}* failed, *{warns}* warnings")
+
+    return "\n".join(lines)
+
+
+def _build_reply_keyboard(tool_names: list[str] | None = None) -> dict:
+    """Build an inline keyboard to attach to bot responses."""
+    buttons = [[{"text": "🔄 Retry", "callback_data": "retry"}]]
+    return {"inline_keyboard": buttons}
+
+
+def _handle_callback_query(query: dict, token: str):
+    """Handle inline keyboard button presses."""
+    query_id = query.get("id")
+    data = query.get("data", "")
+    msg = query.get("message", {})
+    chat_id = msg.get("chat", {}).get("id")
+    user_id = query.get("from", {}).get("id")
+    topic_id = msg.get("message_thread_id")
+    thread_id = None
+    if topic_id:
+        thread_id = get_thread_for_topic(chat_id, topic_id)
+
+    if not chat_id:
+        _api("answerCallbackQuery", token, callback_query_id=query_id, text="⚠️ Error")
+        return
+
+
+    owner_id = get_owner_id()
+    if owner_id and user_id != owner_id:
+        _api("answerCallbackQuery", token, callback_query_id=query_id,
+             text="⛔ Only the owner can use this")
+        return
+
+    if data == "retry":
+
+        tid = thread_id or db.kv_get("telegram:thread_id") or None
+        recent = db.get_recent_messages(limit=4, thread_id=tid)
+        last_user = None
+        for m in reversed(recent):
+            if m.get("role") == "user":
+                last_user = m.get("content", "")
+                break
+        if last_user:
+            _api("answerCallbackQuery", token, callback_query_id=query_id, text="🔄 Retrying...")
+            _process_message(chat_id, last_user, user_id, "",
+                             msg.get("message_id", 0), token,
+                             topic_id=topic_id, thread_id=thread_id)
+        else:
+            _api("answerCallbackQuery", token, callback_query_id=query_id,
+                 text="No message to retry")
+
+    elif data == "clear":
+        tid = thread_id or db.kv_get("telegram:thread_id") or None
+        db.clear_history(thread_id=tid)
+        _api("answerCallbackQuery", token, callback_query_id=query_id,
+             text="🗑 History cleared")
+
+    elif data == "toggle_thinking":
+        current = db.kv_get("thinking_enabled") == "true"
+        new_val = not current
+        db.kv_set("thinking_enabled", str(new_val).lower())
+        state = "ON ✅" if new_val else "OFF"
+        _api("answerCallbackQuery", token, callback_query_id=query_id,
+             text=f"🧠 Thinking: {state}")
+
+    elif data == "toggle_voice":
+        current = db.kv_get(f"voice_mode:{chat_id}") == "1"
+        new_val = not current
+        db.kv_set(f"voice_mode:{chat_id}", "1" if new_val else "0")
+        state = "ON ✅" if new_val else "OFF"
+        _api("answerCallbackQuery", token, callback_query_id=query_id,
+             text=f"🔊 Voice: {state}")
+
+    else:
+        _api("answerCallbackQuery", token, callback_query_id=query_id, text="Unknown action")
+
+
+def send_message(chat_id: int, text: str, token: str | None = None,
+                 reply_to: int | None = None, topic_id: int | None = None,
+                 reply_markup: dict | None = None):
+    """Send a message to a Telegram chat with MarkdownV2 formatting."""
+    token = token or get_token()
+    if not token:
+        return
+
+
+    try:
+        import telemetry as _tel
+        _tel.track_feature_first_use("telegram_send")
+    except Exception:
+        pass
+
+    chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
+    for ci, chunk in enumerate(chunks):
+        base_kwargs = {"chat_id": chat_id}
+        if reply_to:
+            base_kwargs["reply_to_message_id"] = reply_to
+        if topic_id:
+            base_kwargs["message_thread_id"] = topic_id
+
+        if reply_markup and ci == len(chunks) - 1:
+            base_kwargs["reply_markup"] = reply_markup
+
+
+        sent = False
+
+
+        result = _send_rich_safe(
+            chat_id, chunk, token,
+            reply_to=reply_to if ci == 0 else None,
+            topic_id=topic_id,
+            reply_markup=base_kwargs.get("reply_markup"),
+        )
+        if result.get("ok"):
+            sent = True
+
+
+        if not sent and _looks_like_html(chunk):
+            result = _api("sendMessage", token, **base_kwargs, text=chunk, parse_mode="HTML")
+            if result.get("ok"):
+                sent = True
+                _log.info("sent as raw HTML (agent-emitted tags)")
+
+
+        if not sent:
+            md2_text = _to_markdownv2(chunk)
+            result = _api("sendMessage", token, **base_kwargs, text=md2_text, parse_mode="MarkdownV2")
+            if result.get("ok"):
+                sent = True
+
+
+        if not sent:
+            html_text = _to_html(chunk)
+            result = _api("sendMessage", token, **base_kwargs, text=html_text, parse_mode="HTML")
+            if result.get("ok"):
+                sent = True
+                _log.info("sent as HTML fallback")
+
+
+        if not sent:
+            result = _api("sendMessage", token, **base_kwargs, text=chunk, parse_mode="Markdown")
+            if result.get("ok"):
+                sent = True
+                _log.info("sent as legacy Markdown fallback")
+
+
+        if not sent:
+            _api("sendMessage", token, **base_kwargs, text=chunk)
+            _log.warning("sent as plain text (all formatting failed)")
+
+
+_rich_supported: bool | None = None
+
+
+def _rich_message_payload(text: str) -> dict:
+    """Wrap a reply into an ``InputRichMessage``. Agent-emitted raw HTML goes
+    in the ``html`` field (verbatim); everything else as ``markdown``. Exactly
+    one field is set, per the API contract."""
+    if _looks_like_html(text):
+        return {"html": text}
+    return {"markdown": text}
+
+
+def _send_rich_safe(chat_id: int, text: str, token: str, *,
+                    reply_to: int | None = None, topic_id: int | None = None,
+                    reply_markup: dict | None = None,
+                    edit_message_id: int | None = None) -> dict:
+    """Send (or edit a message into) a Bot API 10.1 rich message.
+
+    Returns the raw API result dict. Caches whether the deployment supports
+    rich messages so older Bot API versions stop being probed after the first
+    miss. On any non-``ok`` result the caller falls back to the classic
+    MarkdownV2/HTML chain.
+    """
+    global _rich_supported
+    if _rich_supported is False or not text:
+        return {"ok": False, "description": "rich unsupported or empty"}
+    rm = _rich_message_payload(text)
+    if edit_message_id is not None:
+        kwargs: dict = {"chat_id": chat_id, "message_id": edit_message_id, "rich_message": rm}
+        if reply_markup:
+            kwargs["reply_markup"] = reply_markup
+        result = _api("editMessageText", token, **kwargs)
+    else:
+        kwargs = {"chat_id": chat_id, "rich_message": rm}
+        if reply_to:
+            kwargs["reply_parameters"] = {"message_id": reply_to}
+        if topic_id:
+            kwargs["message_thread_id"] = topic_id
+        if reply_markup:
+            kwargs["reply_markup"] = reply_markup
+        result = _api("sendRichMessage", token, **kwargs)
+    if result.get("ok"):
+        _rich_supported = True
+        return result
+    desc = result.get("description", "").lower()
+
+
+    if _method_unsupported(result) or "unsupported" in desc or "rich_message" in desc:
+        _rich_supported = False
+        _log.info("sendRichMessage not supported by this Bot API — using MarkdownV2/HTML")
+    return result
+
+
+_rich_draft_supported: bool | None = None
+
+
+def send_rich_draft(chat_id: int, draft_id: int, text: str, token: str | None = None,
+                    topic_id: int | None = None) -> dict:
+    """Stream a partial rich message via sendRichMessageDraft. ``draft_id``
+    keys the ephemeral preview so successive calls refresh the same draft."""
+    token = token or get_token()
+    if not token or not text:
+        return {"ok": False}
+    rm = _rich_message_payload(text)
+    kwargs: dict = {"chat_id": chat_id, "draft_id": draft_id, "rich_message": rm}
+    if topic_id:
+        kwargs["message_thread_id"] = topic_id
+    return _api("sendRichMessageDraft", token, **kwargs)
+
+
+def _send_rich_draft_safe(chat_id: int, draft_id: int, text: str, token: str,
+                          topic_id: int | None = None) -> bool:
+    """Send a streaming rich draft; return True if delivered. Caches support
+    so older Bot APIs / non-private chats stop being probed after a miss."""
+    global _rich_draft_supported
+    if _rich_draft_supported is False:
+        return False
+    result = send_rich_draft(chat_id, draft_id, text, token, topic_id=topic_id)
+    if result.get("ok"):
+        _rich_draft_supported = True
+        return True
+    desc = result.get("description", "").lower()
+    if _method_unsupported(result) or "unsupported" in desc or "draft_id" in desc:
+        _rich_draft_supported = False
+        _log.info("sendRichMessageDraft not supported — streaming via placeholder edits")
+    return False
+
+
+def _build_thinking_draft_body(thinking: str, content: str) -> str:
+    """Compose a streaming-draft body: the agent's current reasoning in a
+    ``<tg-thinking>`` block (tail-capped) above the partial answer. Either part
+    may be empty; returns ``""`` when there's nothing to show yet."""
+    parts = []
+    th = (thinking or "").strip()
+    if th:
+        parts.append(f"<tg-thinking>{th[-600:]}</tg-thinking>")
+    c = (content or "").strip()
+    if c:
+
+
+        parts.append(c[-3000:])
+    return "\n\n".join(parts)
+
+
+def _send_audio(chat_id: int, audio_bytes: bytes, token: str,
+                reply_to: int | None = None, topic_id: int | None = None):
+    """Send an audio file (mp3) to a Telegram chat via multipart upload."""
+    import io
+    url = f"https://api.telegram.org/bot{token}/sendAudio"
+    data = {"chat_id": chat_id, "title": "Voice reply"}
+    if reply_to:
+        data["reply_to_message_id"] = reply_to
+    if topic_id:
+        data["message_thread_id"] = topic_id
+    files = {"audio": ("voice.mp3", io.BytesIO(audio_bytes), "audio/mpeg")}
+    try:
+        r = requests.post(url, data=data, files=files, timeout=60)
+        result = r.json()
+        if not result.get("ok"):
+            _log.warning(f"sendAudio failed: {result.get('description', '')}")
+    except Exception as e:
+        _log.error(f"sendAudio error: {e}")
+
+
+def get_me(token: str | None = None) -> dict:
+    """Get bot info."""
+    token = token or get_token()
+    if not token:
+        return {}
+    result = _api("getMe", token)
+    return result.get("result", {})
+
+
+def start(on_message: Callable | None = None):
+    """Start the Telegram bot polling loop.
+
+    Acquires a process-level lock first so a second castor instance
+    (e.g. a leftover uvicorn) never ends up fighting the first one
+    over getUpdates.
+    """
+    global _thread, _running, _on_message
+
+    if _running:
+        _log.info("already running")
+        return
+
+    token = get_token()
+    if not token:
+        _log.warning("no bot token configured")
+        return
+
+    if not _acquire_lock():
+
+
+        return
+
+    _on_message = on_message
+    _running = True
+
+    atexit.register(_release_lock)
+    _thread = threading.Thread(target=_poll_loop, args=(token,), daemon=True)
+    _thread.start()
+    _log.info("telegram bot started")
+
+
+def stop():
+    """Stop the polling loop and release the single-instance lock."""
+    global _running
+    _running = False
+    _release_lock()
+    _log.info("telegram bot stopped")
+
+
+def _poll_loop(token: str):
+    """Long polling loop."""
+    global _running
+    offset = 0
+
+    me = get_me(token)
+    if not me:
+        _log.error("failed to connect to Telegram — invalid token?")
+        _running = False
+        return
+
+
+    _api("deleteWebhook", token, drop_pending_updates=True)
+
+    _api("getUpdates", token, offset=-1, timeout=1)
+    _log.info("webhook cleared, pending updates flushed")
+
+    bot_username = me.get("username", "")
+    _log.info(f"connected as @{bot_username}")
+    db.kv_set("telegram:bot_username", bot_username)
+
+
+    _register_commands(token)
+
+    while _running:
+        try:
+            result = _api("getUpdates", token, offset=offset, timeout=30,
+                          allowed_updates=["message"])
+            if not result.get("ok"):
+                _log.warning(f"getUpdates failed: {result.get('description')}")
+                time.sleep(5)
+                continue
+
+            for update in result.get("result", []):
+                offset = update["update_id"] + 1
+                _handle_update(update, token, bot_username)
+
+        except Exception as e:
+            _log.error(f"poll error: {e}", exc_info=True)
+            time.sleep(5)
+
+
+def _describe_nontext_message(msg: dict) -> str | None:
+    """Map a non-text Telegram message to a short bracketed text injection.
+
+    Handles the message types that carry no ``text`` / ``caption`` and that
+    ``_handle_update`` doesn't already consume (photo, document, voice/audio
+    are handled upstream and return None here). Returns ``None`` for those,
+    for plain-text messages, and for anything unrecognised — so the caller
+    only injects a synthetic prompt when there's genuinely something to say.
+
+    Pure function: reads the update dict, performs no I/O.
+    """
+
+    if msg.get("photo") or msg.get("document") or msg.get("voice") or msg.get("audio"):
+        return None
+    if msg.get("text") or msg.get("caption"):
+        return None
+
+    loc = msg.get("location")
+    if loc and "venue" not in msg:
+        return (
+            f"[User shared a location: latitude {loc.get('latitude')}, "
+            f"longitude {loc.get('longitude')}.]"
+        )
+
+    venue = msg.get("venue")
+    if venue:
+        vloc = venue.get("location", {})
+        return (
+            f"[User shared a venue: \"{venue.get('title', '')}\" — "
+            f"{venue.get('address', '')} "
+            f"(latitude {vloc.get('latitude')}, longitude {vloc.get('longitude')}).]"
+        )
+
+    contact = msg.get("contact")
+    if contact:
+        name = " ".join(
+            p for p in (contact.get("first_name"), contact.get("last_name")) if p
+        )
+        return f"[User shared a contact: {name}, phone {contact.get('phone_number', '')}.]"
+
+    poll = msg.get("poll")
+    if poll:
+        opts = ", ".join(o.get("text", "") for o in poll.get("options", []))
+        return f"[User sent a poll. Question: \"{poll.get('question', '')}\". Options: {opts}.]"
+
+    dice = msg.get("dice")
+    if dice:
+        return f"[User rolled {dice.get('emoji', '🎲')} → {dice.get('value')}.]"
+
+    sticker = msg.get("sticker")
+    if sticker:
+        emoji = sticker.get("emoji")
+        return f"[User sent a sticker{f' ({emoji})' if emoji else ''}.]"
+
+    video = msg.get("video")
+    if video:
+        return (
+            f"[User sent a video ({video.get('duration', '?')}s, "
+            f"{video.get('width', '?')}x{video.get('height', '?')}). "
+            f"Castor can't view video content yet — ask for a description if needed.]"
+        )
+
+    if msg.get("video_note"):
+        dur = msg["video_note"].get("duration", "?")
+        return f"[User sent a round video note ({dur}s). Castor can't view video content yet.]"
+
+
+    if msg.get("animation"):
+        return "[User sent an animation/GIF. Castor can't view animated content yet.]"
+
+    return None
+
+
+def _handle_update(update: dict, token: str, bot_username: str):
+    """Process a single Telegram update."""
+
+    callback_query = update.get("callback_query")
+    if callback_query:
+        _handle_callback_query(callback_query, token)
+        return
+
+    msg = update.get("message")
+    if not msg:
+        return
+
+    chat_id = msg["chat"]["id"]
+    chat_type = msg["chat"].get("type", "private")
+    user_id = msg["from"]["id"]
+    username = msg["from"].get("username", "")
+    text = msg.get("text", "") or msg.get("caption", "")
+    message_id = msg.get("message_id")
+    topic_id = msg.get("message_thread_id")
+
+
+    image_b64 = None
+    photo = msg.get("photo")
+    if photo:
+        try:
+            import base64
+            file_id = photo[-1]["file_id"]
+            file_info = _api("getFile", get_token(), file_id=file_id)
+            if file_info and file_info.get("ok"):
+                file_path = file_info["result"]["file_path"]
+                url = f"https://api.telegram.org/file/bot{get_token()}/{file_path}"
+                image_data = requests.get(url, timeout=30).content
+                image_b64 = base64.b64encode(image_data).decode()
+                if not text:
+                    text = "What's in this image?"
+                _log.info(f"photo received from @{username} ({len(image_data)} bytes)")
+        except Exception as e:
+            _log.error(f"photo download failed: {e}")
+
+
+    doc = msg.get("document")
+    if doc:
+        try:
+            import re as _re
+            from pathlib import Path
+            from server import UPLOADS_DIR
+            fname_raw = doc.get("file_name", "file.txt")
+            file_id = doc["file_id"]
+            file_info = _api("getFile", get_token(), file_id=file_id)
+            if file_info and file_info.get("ok"):
+                file_path_remote = file_info["result"]["file_path"]
+                url = f"https://api.telegram.org/file/bot{get_token()}/{file_path_remote}"
+                file_data = requests.get(url, timeout=30).content
+
+                import uuid as _uuid
+                fname_safe = _re.sub(r'[^\w.\-]+', '_', Path(fname_raw).name)[:80] or "file.txt"
+                stem = Path(fname_safe).stem
+                ext = Path(fname_safe).suffix or ".txt"
+                doc_id = str(_uuid.uuid4())[:8]
+                saved = UPLOADS_DIR / f"{doc_id}_{stem}{ext}"
+                saved.write_bytes(file_data)
+                abs_path = str(saved.resolve())
+                size_kb = len(file_data) / 1024
+                ref = (
+                    f"[File attached: {fname_raw} ({size_kb:.1f} KB) — saved at {abs_path}. "
+                    f"To view contents call read_file(path). "
+                    f"To add to the knowledge base call tool_search('rag') then rag_index(path).]"
+                )
+                text = (text + "\n\n" if text else "") + ref
+                _log.info(f"document from @{username}: {fname_raw} → {abs_path} ({len(file_data)}b)")
+        except Exception as e:
+            _log.error(f"document download failed: {e}")
+
+
+    is_voice = False
+    voice = msg.get("voice") or msg.get("audio")
+    if voice and not text:
+        try:
+            import stt
+            if not stt.is_available():
+                send_message(chat_id, "🎤 Voice not supported — install faster-whisper:\n`pip install faster-whisper`", token, topic_id=topic_id)
+                return
+            file_id = voice["file_id"]
+            file_info = _api("getFile", get_token(), file_id=file_id)
+            if file_info and file_info.get("ok"):
+                file_path = file_info["result"]["file_path"]
+                url = f"https://api.telegram.org/file/bot{get_token()}/{file_path}"
+                audio_data = requests.get(url, timeout=30).content
+                fmt = file_path.rsplit(".", 1)[-1] if "." in file_path else "ogg"
+                text = stt.transcribe(audio_data, format=fmt)
+                if text.startswith("[STT Error]"):
+                    send_message(chat_id, text, token, topic_id=topic_id)
+                    return
+                is_voice = True
+                _log.info(f"voice transcribed from @{username} ({len(audio_data)}b): {text[:100]}")
+        except Exception as e:
+            _log.error(f"voice transcription failed: {e}")
+            send_message(chat_id, "⚠️ Failed to transcribe voice message.", token, topic_id=topic_id)
+            return
+
+
+    if not image_b64 and not is_voice:
+        media_note = _describe_nontext_message(msg)
+        if media_note:
+            text = media_note + (("\n\n" + text) if text else "")
+
+    if not text and not image_b64:
+        return
+
+
+    if not is_verified():
+
+        if is_banned(user_id):
+            _log.warning(f"banned user {user_id} (@{username}) tried to message")
+            send_message(chat_id, "🚫 Access denied.", token)
+            return
+
+        pending = get_pending_code()
+        if not pending:
+
+            send_message(chat_id,
+                "🔐 Activation required.\n\n"
+                "Generate an activation code in castor:\n"
+                "• Web UI → Settings → Telegram\n"
+                "• CLI → `/telegram activate`\n\n"
+                "Then send the 6-digit code here.",
+                token)
+            _log.info(f"no pending code, told @{username} ({user_id}) to generate one")
+            return
+
+        if text.strip() == pending:
+
+            set_owner_id(user_id)
+            db.kv_set("telegram:owner_username", username)
+            clear_verification()
+            clear_attempts(user_id)
+            send_message(chat_id,
+                "✅ Verified! You are now the owner.\n\n"
+                "I'll only respond to you from now on.",
+                token)
+            _log.info(f"owner verified: @{username} ({user_id})")
+            return
+        else:
+
+            attempts = increment_attempts(user_id)
+            remaining = MAX_ATTEMPTS - attempts
+            if remaining <= 0:
+                send_message(chat_id, "🚫 Too many failed attempts. Access permanently denied.", token)
+                _log.warning(f"user {user_id} (@{username}) banned after {MAX_ATTEMPTS} failed attempts")
+            else:
+                send_message(chat_id,
+                    f"❌ Wrong code. {remaining} attempt{'s' if remaining != 1 else ''} remaining.",
+                    token)
+                _log.info(f"wrong code from @{username} ({user_id}), attempt {attempts}/{MAX_ATTEMPTS}")
+            return
+
+
+    owner_id = get_owner_id()
+    if text.strip().startswith("/") and user_id == owner_id:
+
+        parts = text.strip().split(None, 1)
+        cmd_part = parts[0].lstrip("/").split("@")[0].lower()
+        cmd_args = parts[1] if len(parts) > 1 else ""
+
+
+        cmd_thread = None
+        if topic_id and chat_type in ("group", "supergroup") and is_topics_enabled():
+            cmd_thread = get_thread_for_topic(chat_id, topic_id)
+        elif chat_type == "private":
+            cmd_thread = _get_or_create_dm_thread(chat_id)
+        elif chat_type in ("group", "supergroup"):
+            cmd_thread = _get_or_create_dm_thread(chat_id)
+
+        if _handle_bot_command(cmd_part, cmd_args, chat_id, user_id, token,
+                               topic_id=topic_id, thread_id=cmd_thread):
+            return
+
+
+    if chat_type == "private":
+        if user_id != owner_id:
+            _log.warning(f"blocked DM from non-owner {user_id} (@{username})")
+            return
+        # Use dedicated Telegram DM thread (never share with web UI active thread)
+        dm_thread = _get_or_create_dm_thread(chat_id)
+        _process_message(chat_id, text, user_id, username, message_id, token,
+                         topic_id=None, thread_id=dm_thread, image_b64=image_b64,
+                         is_voice=is_voice)
+        return
+
+
+    if chat_type in ("group", "supergroup"):
+        allowed_groups = get_allowed_groups()
+        if allowed_groups and chat_id not in allowed_groups:
+            return
+
+
+        group_mode = get_group_mode()
+        should_respond = False
+
+        if group_mode == "off":
+            return  # bot never responds in groups
+        elif group_mode == "mention":
+
+            if f"@{bot_username}" in text:
+                text = text.replace(f"@{bot_username}", "").strip()
+                should_respond = True
+            elif msg.get("reply_to_message", {}).get("from", {}).get("username") == bot_username:
+                should_respond = True
+        else:
+
+
+            should_respond = True
+
+        if not should_respond:
+            return
+
+
+        if user_id != owner_id:
+            _log.debug(f"ignored group msg from non-owner {user_id}")
+            return
+
+
+        thread_id = None
+        if topic_id and is_topics_enabled():
+            topic_name = ""
+
+            thread_id = _get_or_create_thread_for_topic(chat_id, topic_id, topic_name)
+        else:
+            # Group without topics — use dedicated group thread (never share with web UI)
+            thread_id = _get_or_create_dm_thread(chat_id)
+
+        _process_message(chat_id, text, user_id, username, message_id, token,
+                         topic_id=topic_id, thread_id=thread_id,
+                         image_b64=image_b64, is_voice=is_voice)
+
+
+def _process_message(chat_id: int, text: str, user_id: int, username: str,
+                     message_id: int, token: str, topic_id: int | None = None,
+                     thread_id: str | None = None, image_b64: str | None = None,
+                     is_voice: bool = False):
+    """Route message to agent and send response."""
+    _log.info(f"processing: @{username} in {chat_id}" +
+              (f" topic={topic_id}" if topic_id else "") +
+              (f" thread={thread_id}" if thread_id else "") +
+              (" [+image]" if image_b64 else "") +
+              f": {text[:100]}")
+
+
+    import providers
+    if providers.get_active_name() in ("lmstudio", "ollama"):
+        import requests as _req
+        try:
+            p = providers.get_provider()
+            api_base = p.get("url", "").rstrip("/").replace("/v1", "")
+            model = providers.get_model()
+            r = _req.get(f"{api_base}/api/v1/models", timeout=5)
+            if r.ok:
+                models = r.json().get("models", [])
+                model_loaded = any(
+                    m.get("key") == model and m.get("loaded_instances")
+                    for m in models
+                )
+                if not model_loaded:
+                    send_message(chat_id, f"⏳ Loading model `{model}`...", token, topic_id=topic_id)
+        except Exception:
+            pass
+
+
+    typing_active = threading.Event()
+    typing_active.set()
+
+    def _keep_typing():
+        while typing_active.is_set():
+            kwargs = {"chat_id": chat_id, "action": "typing"}
+            if topic_id:
+                kwargs["message_thread_id"] = topic_id
+            _api("sendChatAction", token, **kwargs)
+            typing_active.wait(4)
+            if not typing_active.is_set():
+                break
+
+    typing_thread = threading.Thread(target=_keep_typing, daemon=True)
+    typing_thread.start()
+
+
+    import agent
+
+    _stream_buf = ""
+    _stream_lock = threading.Lock()
+    _last_update_ts = [0.0]
+    _STREAM_INTERVAL = 1.5
+    _stream_msg_id = [None]
+    _thinking_buf = []
+    _status_text = [""]
+
+
+    _use_rich_draft = [bool(chat_id and chat_id > 0)]
+    _draft_id = abs(int(message_id)) if message_id else (abs(int(chat_id)) if chat_id else 1)
+
+    def _update_stream():
+        """Send or update the streaming preview with current buffers."""
+        with _stream_lock:
+            content = _stream_buf.strip()
+            thinking = "".join(_thinking_buf).strip()
+        status = _status_text[0]
+
+
+        if _use_rich_draft[0]:
+            body = _build_thinking_draft_body(thinking, content)
+            if not body:
+                return
+            if status and content:
+                body = body + f"\n\n_{status}_"
+            if _send_rich_draft_safe(chat_id, _draft_id, body, token, topic_id=topic_id):
+                return
+
+            _use_rich_draft[0] = False
+
+
+        think_block = (f"💭 {thinking[-280:]}\n\n" if thinking else "")
+        body_txt = (think_block + content[-2500:]).strip()
+        if not body_txt:
+            return
+        display = body_txt + (f"\n\n_{status}_" if status else "") + " ▍"
+        if _stream_msg_id[0] is None:
+            kwargs = {"chat_id": chat_id, "text": display}
+            if topic_id:
+                kwargs["message_thread_id"] = topic_id
+            if message_id:
+                kwargs["reply_to_message_id"] = message_id
+            result = _api("sendMessage", token, **kwargs)
+            if result.get("ok"):
+                _stream_msg_id[0] = result["result"]["message_id"]
+                _log.info(f"streaming placeholder sent: msg_id={_stream_msg_id[0]}")
+        else:
+            result = _api("editMessageText", token,
+                 chat_id=chat_id, message_id=_stream_msg_id[0], text=display)
+            if not result.get("ok"):
+                _log.debug(f"editMessageText: {result.get('description', '')}")
+
+    def _tg_content_cb(text_chunk: str):
+        nonlocal _stream_buf
+        with _stream_lock:
+            _stream_buf += text_chunk
+        now = time.time()
+        if now - _last_update_ts[0] >= _STREAM_INTERVAL:
+            _update_stream()
+            _last_update_ts[0] = now
+
+    def _tg_thinking_cb(text_chunk: str):
+        _thinking_buf.append(text_chunk)
+
+        if _use_rich_draft[0]:
+            now = time.time()
+            if now - _last_update_ts[0] >= _STREAM_INTERVAL:
+                _update_stream()
+                _last_update_ts[0] = now
+
+    def _tg_status_cb(status_text: str):
+        _status_text[0] = status_text
+
+        now = time.time()
+        if now - _last_update_ts[0] >= _STREAM_INTERVAL:
+            _update_stream()
+            _last_update_ts[0] = now
+
+
+    streaming_on = db.kv_get("streaming_enabled") != "false"
+    from turn_context import TurnContext
+    tg_ctx = TurnContext(
+        source="telegram",
+        session_id=str(chat_id) if chat_id else None,
+        on_content=_tg_content_cb if streaming_on else None,
+        on_thinking=_tg_thinking_cb if streaming_on else None,
+        on_status=_tg_status_cb if streaming_on else None,
+    )
+    _push_active_ctx(tg_ctx)
+
+
+    def _stream_keepalive():
+        while typing_active.is_set():
+            typing_active.wait(8)
+            if not typing_active.is_set():
+                break
+
+
+            if time.time() - _last_update_ts[0] < 6:
+                continue
+            try:
+                _update_stream()
+                _last_update_ts[0] = time.time()
+            except Exception:
+                pass
+
+    if streaming_on:
+        threading.Thread(target=_stream_keepalive, daemon=True).start()
+
+    if _on_message:
+        try:
+            response = _on_message(chat_id, text, user_id, username, thread_id,
+                                    image_b64=image_b64)
+
+
+            if response or (_stream_buf or "").strip():
+                typing_active.clear()
+
+
+                tool_names = getattr(agent, '_last_tools', []) or []
+
+
+                from utils import strip_tool_call_markup as _strip_tc
+                streamed = _strip_tc((_stream_buf or "").strip())
+                reply_text = streamed or _strip_tc((response or "").strip())
+                parts = []
+
+
+                parts.append(reply_text if reply_text else "✅")
+                if tool_names:
+                    tools_str = ", ".join(f"`{t}`" for t in tool_names)
+                    parts.append(f"\n🔧 {tools_str}")
+
+                enriched = "\n\n".join(parts)
+
+
+                keyboard = _build_reply_keyboard(tool_names)
+
+                if _stream_msg_id[0]:
+
+
+                    result = _send_rich_safe(
+                        chat_id, enriched, token,
+                        edit_message_id=_stream_msg_id[0], reply_markup=keyboard,
+                    )
+                    if not result.get("ok") and _looks_like_html(enriched):
+                        result = _api("editMessageText", token,
+                                      chat_id=chat_id, message_id=_stream_msg_id[0],
+                                      text=enriched, parse_mode="HTML",
+                                      reply_markup=keyboard)
+                    if not result.get("ok"):
+                        md2 = _to_markdownv2(enriched)
+                        result = _api("editMessageText", token,
+                                      chat_id=chat_id, message_id=_stream_msg_id[0],
+                                      text=md2, parse_mode="MarkdownV2",
+                                      reply_markup=keyboard)
+                    if not result.get("ok"):
+                        html = _to_html(enriched)
+                        result = _api("editMessageText", token,
+                                      chat_id=chat_id, message_id=_stream_msg_id[0],
+                                      text=html, parse_mode="HTML",
+                                      reply_markup=keyboard)
+                    if not result.get("ok"):
+                        _api("editMessageText", token,
+                             chat_id=chat_id, message_id=_stream_msg_id[0],
+                             text=enriched, reply_markup=keyboard)
+                else:
+
+                    send_message(chat_id, enriched, token, reply_to=message_id,
+                                 topic_id=topic_id, reply_markup=keyboard)
+
+
+                import tools as _tools_mod
+                for f in _tools_mod.get_pending_files():
+                    try:
+                        fpath = f["path"]
+                        tg_url = f"https://api.telegram.org/bot{token}/sendDocument"
+                        tg_data = {"chat_id": chat_id, "caption": f.get("caption", f["name"])}
+                        if topic_id:
+                            tg_data["message_thread_id"] = topic_id
+                        with open(fpath, "rb") as fp:
+                            tg_files = {"document": (f["name"], fp, "application/octet-stream")}
+                            r = requests.post(tg_url, data=tg_data, files=tg_files, timeout=60)
+                        if r.json().get("ok"):
+                            _log.info(f"sent file to telegram: {f['name']}")
+                        else:
+                            _log.warning(f"sendDocument failed: {r.json().get('description', '')}")
+                    except Exception as e:
+                        _log.warning(f"failed to send file {f.get('name')}: {e}")
+
+
+                voice_mode = db.kv_get(f"voice_mode:{chat_id}") == "1"
+                if is_voice or voice_mode:
+                    try:
+                        import tts
+                        if tts.is_available():
+                            audio = tts.synthesize(response, format="mp3")
+                            if audio:
+                                _send_audio(chat_id, audio, token, reply_to=message_id, topic_id=topic_id)
+                                _log.info(f"TTS voice sent to {chat_id} ({len(audio)} bytes)")
+                            else:
+                                _log.warning("TTS returned None — server may be down")
+                        else:
+                            _log.warning(f"TTS not available for voice mode in {chat_id}")
+                    except Exception as e:
+                        _log.error(f"TTS failed: {e}")
+            else:
+
+
+                typing_active.clear()
+                tool_names = getattr(agent, '_last_tools', []) or []
+                hint = ("\n\n🔧 " + ", ".join(f"`{t}`" for t in tool_names)) if tool_names else ""
+                send_message(chat_id, "✅ Готово." + hint, token,
+                             reply_to=message_id, topic_id=topic_id)
+        except Exception as e:
+            _log.error(f"handler error: {e}", exc_info=True)
+            typing_active.clear()
+            send_message(chat_id, f"⚠️ Error: {str(e)[:200]}", token, topic_id=topic_id)
+        finally:
+            typing_active.clear()
+            _pop_active_ctx()
+
+
+def status() -> dict:
+    """Get bot status."""
+    pending = get_pending_code()
+    return {
+        "enabled": is_enabled(),
+        "running": _running,
+        "has_token": bool(get_token()),
+        "verified": is_verified(),
+        "username": db.kv_get("telegram:bot_username") or "",
+        "owner_id": get_owner_id(),
+        "owner_username": get_owner_username(),
+        "has_pending_code": bool(pending),
+        "pending_code": pending or "",
+        "allowed_groups": get_allowed_groups(),
+        "group_mode": get_group_mode(),
+        "topics_enabled": is_topics_enabled(),
+    }

@@ -1,0 +1,716 @@
+"""Provider management — switch between LLM endpoints on the fly.
+
+Stores provider configs in SQLite. Supports any OpenAI-compatible API:
+LM Studio, Ollama, OpenAI, OpenRouter, Together, Groq, local vLLM, etc.
+
+Usage:
+    import providers
+    client = providers.get_client()       # OpenAI client for current provider
+    providers.set_model("gpt-4o")         # switch model
+    providers.switch("openai")            # switch provider
+    providers.add("groq", url="...", key="...", models=["llama-3.1-70b"])
+"""
+
+import json
+from openai import OpenAI
+import config
+import db
+import logger
+
+_log = logger.get("providers")
+
+
+_client: OpenAI | None = None
+_client_key: str | None = None
+
+
+PRESETS = {
+    "lmstudio": {
+        "name": "LM Studio",
+        "url": "http://localhost:1234/v1",
+        "key": "lm-studio",
+        "models": [],
+    },
+    "ollama": {
+        "name": "Ollama",
+        "url": "http://localhost:11434/v1",
+        "key": "ollama",
+        "models": [],
+    },
+    "openai": {
+        "name": "OpenAI",
+        "url": "https://api.openai.com/v1",
+        "key": "",  # user must set
+        "models": ["gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "o4-mini"],
+    },
+    "openrouter": {
+        "name": "OpenRouter",
+        "url": "https://openrouter.ai/api/v1",
+        "key": "",
+        "models": ["anthropic/claude-sonnet-4", "google/gemini-2.5-flash", "deepseek/deepseek-chat"],
+    },
+    "groq": {
+        "name": "Groq",
+        "url": "https://api.groq.com/openai/v1",
+        "key": "",
+        "models": ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768"],
+    },
+    "together": {
+        "name": "Together",
+        "url": "https://api.together.xyz/v1",
+        "key": "",
+        "models": ["meta-llama/Llama-3.3-70B-Instruct-Turbo", "Qwen/Qwen2.5-72B-Instruct-Turbo"],
+    },
+    "deepseek": {
+        "name": "DeepSeek",
+        "url": "https://api.deepseek.com/v1",
+        "key": "",
+        "models": ["deepseek-chat", "deepseek-reasoner"],
+    },
+
+
+    "perplexity": {
+
+
+        "name": "Perplexity",
+        "url": "https://api.perplexity.ai",
+        "key": "",
+        "models": ["sonar-pro", "sonar-reasoning", "sonar", "sonar-reasoning-pro"],
+    },
+    "cerebras": {
+
+
+        "name": "Cerebras",
+        "url": "https://api.cerebras.ai/v1",
+        "key": "",
+        "models": ["llama-3.3-70b", "llama3.1-8b", "qwen-3-32b"],
+    },
+    "mistral": {
+
+
+        "name": "Mistral",
+        "url": "https://api.mistral.ai/v1",
+        "key": "",
+        "models": ["mistral-large-latest", "mistral-small-latest",
+                   "codestral-latest", "ministral-8b-latest"],
+    },
+    "minimax": {
+
+
+        "name": "MiniMax",
+        "url": "https://api.minimax.io/v1",
+        "key": "",
+        "models": ["MiniMax-M2.5", "MiniMax-M2.1", "MiniMax-M2",
+                   "MiniMax-M1", "MiniMax-Text-01"],
+    },
+
+
+    "anthropic": {
+        "name": "Anthropic",
+        "url": "https://api.anthropic.com",
+        "key": "",
+        "models": [
+            "claude-sonnet-4-5",
+            "claude-opus-4",
+            "claude-haiku-4",
+            "claude-sonnet-4-6",
+            "claude-opus-4-1",
+        ],
+    },
+}
+
+
+CAPABILITIES = {
+    "lmstudio":   {"supports_response_format": False},
+    "ollama":     {"supports_response_format": True},
+    "openai":     {"supports_response_format": True},
+    "openrouter": {"supports_response_format": False},
+    "groq":       {"supports_response_format": True},
+    "together":   {"supports_response_format": True},
+    "deepseek":   {"supports_response_format": True},
+
+
+    "perplexity": {"supports_response_format": False},
+
+
+    "cerebras":   {"supports_response_format": True},
+    "mistral":    {"supports_response_format": True},
+
+
+    "minimax":    {"supports_response_format": True},
+
+
+    "anthropic":  {"supports_response_format": False},
+}
+
+
+def supports(capability: str) -> bool:
+    """Check if active provider supports a capability."""
+    name = get_active_name()
+    return CAPABILITIES.get(name, {}).get(capability, False)
+
+
+def _db_key(k: str) -> str:
+    return f"provider:{k}"
+
+
+def get_active_name() -> str:
+    """Get the active provider name."""
+    return db.kv_get(_db_key("active")) or "ollama"
+
+
+def get_provider(name: str | None = None) -> dict:
+    """Get provider config by name. Returns {name, url, key, models, model}."""
+    name = name or get_active_name()
+
+
+    raw = db.kv_get(_db_key(f"config:{name}"))
+    if raw:
+        try:
+            p = json.loads(raw)
+            p.setdefault("name", name)
+            return p
+        except json.JSONDecodeError:
+            pass
+
+
+    if name in PRESETS:
+        p = dict(PRESETS[name])
+        p["name"] = name
+        return p
+
+    return {"name": name, "url": "", "key": "", "models": []}
+
+
+def get_active() -> dict:
+    """Get the current active provider config + active model."""
+    p = get_provider()
+    p["model"] = get_model()
+    return p
+
+
+def get_model() -> str:
+    """Get the currently active model."""
+    return db.kv_get(_db_key("model")) or config.LLM_MODEL
+
+
+def get_url() -> str:
+    """Get the current API URL."""
+    p = get_provider()
+    return p.get("url") or config.LLM_BASE_URL
+
+
+def get_key() -> str:
+    """Get the current API key."""
+    p = get_provider()
+    return p.get("key") or config.LLM_API_KEY
+
+
+def _wants_native_anthropic_for_openrouter() -> bool:
+    """Opt-in flag for routing OpenRouter Anthropic models through the native
+    adapter. Reads ``setting:anthropic_native_routing`` from kv. Defaults to
+    off — OpenRouter users keep the OpenAI-compatible path until they flip
+    the switch in Settings.
+    """
+    try:
+        return db.kv_get("setting:anthropic_native_routing") == "1"
+    except Exception:
+        return False
+
+
+def get_client():
+    """Get or create a client for the active provider.
+
+    Returns either an ``openai.OpenAI`` instance (for the 10 OpenAI-compatible
+    providers) or an :class:`providers_anthropic.AnthropicNativeClient`
+    (which duck-types ``OpenAI`` — same ``.chat.completions.create()`` surface).
+
+    Routes through the native Anthropic adapter when EITHER:
+      - the active provider is ``anthropic`` and a key is resolvable, OR
+      - the active provider is ``openrouter``, the user has explicitly opted
+        in via ``setting:anthropic_native_routing=1``, AND the active model
+        name starts with ``anthropic/`` (the OpenRouter naming convention).
+
+    Falls back to the OpenAI-compatible client if any of:
+      - the ``anthropic`` SDK is not installed
+      - no Anthropic API key is resolvable
+      - the routing conditions don't match
+    """
+    global _client, _client_key
+
+    url = get_url()
+    key = get_key()
+    cache_key = f"{url}|{key}"
+
+    name = (get_active_name() or "").lower()
+    want_native = False
+    if name == "anthropic":
+        want_native = True
+    elif name == "openrouter" and _wants_native_anthropic_for_openrouter():
+
+
+        model = (get_model() or "").lower()
+        if model.startswith("anthropic/"):
+            want_native = True
+
+    if want_native:
+        try:
+            from providers_anthropic import _resolve_anthropic_key
+            ant_key = _resolve_anthropic_key()
+        except Exception as e:  # pragma: no cover — defensive
+            _log.warning(f"key resolution failed: {e}")
+            ant_key = None
+        if ant_key:
+            native_cache_key = f"anthropic-native|{ant_key}"
+            if _client is not None and _client_key == native_cache_key:
+                return _client
+            try:
+                from providers_anthropic import AnthropicNativeClient
+                _client = AnthropicNativeClient(api_key=ant_key)
+                _client_key = native_cache_key
+                _log.info(f"native Anthropic client created (provider={name})")
+                return _client
+            except (ImportError, RuntimeError) as e:
+
+                _log.warning(
+                    f"native Anthropic adapter unavailable: {e}; "
+                    "falling back to OpenAI-compatible client"
+                )
+
+    if _client is not None and _client_key == cache_key:
+        return _client
+
+    _client = OpenAI(base_url=url, api_key=key)
+    _client_key = cache_key
+    _log.info(f"client created: {url}")
+    return _client
+
+
+# ── Fallback client (separate instance, never touches global state) ──
+_fallback_client: OpenAI | None = None
+_fallback_client_key: str | None = None
+
+
+def get_fallback_config() -> tuple[str, str] | None:
+    """Get fallback provider + model. Returns (provider, model) or None if not configured."""
+    prov = db.kv_get("setting:fallback_provider") or ""
+    model = db.kv_get("setting:fallback_model") or ""
+    if not prov or not model:
+        return None
+    return (prov, model)
+
+
+def get_fallback_client() -> OpenAI | None:
+    """Get or create an OpenAI client for the fallback provider.
+    Does NOT mutate global _client or config values.
+    """
+    global _fallback_client, _fallback_client_key
+
+    fb = get_fallback_config()
+    if not fb:
+        return None
+
+    prov_name, _ = fb
+    p = get_provider(prov_name)
+    url = p.get("url", "")
+    key = p.get("key", "")
+
+    if not url or not key:
+        _log.warning(f"fallback provider '{prov_name}' missing url or key")
+        return None
+
+    cache_key = f"fb|{url}|{key}"
+    if _fallback_client is not None and _fallback_client_key == cache_key:
+        return _fallback_client
+
+    _fallback_client = OpenAI(base_url=url, api_key=key)
+    _fallback_client_key = cache_key
+    _log.info(f"fallback client created: {prov_name} ({url})")
+    return _fallback_client
+
+
+def get_fallback_model() -> str | None:
+    """Get the fallback model name, or None if not configured."""
+    fb = get_fallback_config()
+    return fb[1] if fb else None
+
+
+def ensure_model_loaded() -> bool:
+    """For local providers (lmstudio/ollama): check if model is loaded, auto-load if not.
+
+    Uses LM Studio v1 REST API to check loaded_instances and POST /api/v1/models/load.
+    Returns True if model is ready, False if loading failed.
+    """
+    import requests
+
+    active = get_active_name()
+    if active not in ("lmstudio", "ollama"):
+        return True
+
+    p = get_provider()
+    base_url = p.get("url", "").rstrip("/")
+    if not base_url:
+        return False
+
+
+    api_base = base_url.replace("/v1", "")
+    model = get_model()
+
+
+    try:
+        r = requests.get(f"{api_base}/api/v1/models", timeout=5)
+        if r.ok:
+            models = r.json().get("models", [])
+            for m in models:
+                if m.get("key") == model and m.get("loaded_instances"):
+                    return True
+            _log.info(f"model '{model}' not loaded in memory, auto-loading...")
+    except Exception as e:
+
+        try:
+            r = requests.get(f"{base_url}/models", timeout=5)
+            if r.ok:
+                ids = [m.get("id") for m in r.json().get("data", [])]
+                if model in ids:
+                    return True
+        except Exception:
+            pass
+        _log.warning(f"failed to check models: {e}")
+        return False
+
+
+    try:
+        r = requests.post(
+            f"{api_base}/api/v1/models/load",
+            json={"model": model},
+            timeout=120,
+        )
+        if r.ok:
+            load_time = r.json().get("load_time_seconds", "?")
+            _log.info(f"model '{model}' auto-loaded in {load_time}s")
+            return True
+        else:
+            _log.warning(f"auto-load failed: {r.status_code} {r.text[:200]}")
+            return False
+    except Exception as e:
+        _log.error(f"auto-load error: {e}")
+        return False
+
+
+def _invalidate():
+    """Force client recreation on next call."""
+    global _client, _client_key
+    _client = None
+    _client_key = None
+
+
+def set_model(model: str) -> str:
+    """Set the active model (within current provider). Blocks embedding-only models."""
+
+    model_lower = model.lower()
+    if "embed" in model_lower or "embedding" in model_lower:
+        return f"✗ '{model}' is an embedding model, not a chat model. Use a chat model like qwen/qwen3.5-9b."
+
+    old = get_model()
+    db.kv_set(_db_key("model"), model)
+    _log.info(f"model switched: {old} → {model}")
+
+
+    config.LLM_MODEL = model
+    _invalidate()
+    return f"✓ Model: {model}"
+
+
+_LOCAL_PROVIDERS = {"lmstudio", "ollama"}
+
+
+def _is_local(name: str) -> bool:
+    """Check if provider is a local server (no API key required)."""
+    return name in _LOCAL_PROVIDERS
+
+
+_ping_cache: dict[str, tuple[float, bool]] = {}
+_PING_TTL = 30
+
+
+def ping(name: str, timeout: float = 1.0, use_cache: bool = True) -> bool:
+    """Check if a provider's API is reachable (GET /models with short timeout).
+    Caches result for 30s to avoid hammering local servers."""
+    import time as _t
+    now = _t.time()
+    if use_cache and name in _ping_cache:
+        expires, online = _ping_cache[name]
+        if expires > now:
+            return online
+
+    p = get_provider(name)
+    url = p.get("url", "")
+    if not url:
+        _ping_cache[name] = (now + _PING_TTL, False)
+        return False
+    try:
+        import urllib.request
+        req = urllib.request.Request(f"{url.rstrip('/')}/models", method="GET")
+        key = p.get("key", "")
+        if key:
+            req.add_header("Authorization", f"Bearer {key}")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            online = resp.status == 200
+    except Exception:
+        online = False
+    _ping_cache[name] = (now + _PING_TTL, online)
+    return online
+
+
+def _invalidate_ping_cache(name: str | None = None):
+    """Clear ping cache for one provider or all."""
+    if name is None:
+        _ping_cache.clear()
+    else:
+        _ping_cache.pop(name, None)
+
+
+def switch(name: str) -> str:
+    """Switch to a different provider."""
+    p = get_provider(name)
+    if not p.get("url"):
+        return f"✗ Unknown provider '{name}'. Available: {', '.join(list_providers())}"
+
+    if not p.get("key") and not _is_local(name):
+        return f"✗ Provider '{name}' has no API key. Set it with: /provider {name} key <your-key>"
+
+    old = get_active_name()
+    db.kv_set(_db_key("active"), name)
+
+
+    config.LLM_BASE_URL = p["url"]
+    config.LLM_API_KEY = p.get("key") or "local"
+
+
+    current_model = get_model()
+    provider_models = p.get("models", [])
+
+    if provider_models and current_model not in provider_models:
+
+        new_model = provider_models[0]
+        config.LLM_MODEL = new_model
+        db.kv_set(_db_key("model"), new_model)
+        _log.info(f"model auto-switched: {current_model} → {new_model} (not available on {name})")
+    elif not provider_models:
+
+        try:
+            discovered = fetch_models(name)
+            if discovered and current_model not in discovered:
+                new_model = discovered[0]
+                config.LLM_MODEL = new_model
+                db.kv_set(_db_key("model"), new_model)
+                _log.info(f"model auto-switched: {current_model} → {new_model} (discovered from {name})")
+        except Exception:
+            pass
+
+    _invalidate()
+    _reset_structured_output_cache()
+    _log.info(f"provider switched: {old} → {name} ({p['url']})")
+    return f"✓ Switched to {p.get('name', name)} ({p['url']})"
+
+
+def _reset_structured_output_cache():
+    """Reset agent's structured output failure cache on provider switch.
+
+    The cache is a ``set[str]`` of provider names that returned 400 on
+    ``response_format``. Previously this reassigned it to ``False``, which
+    then blew up on the next ``provider in agent._structured_output_failed``
+    check with ``TypeError: argument of type 'bool' is not iterable``.
+    """
+    try:
+        import agent
+        agent._structured_output_failed.clear()
+    except (ImportError, AttributeError):
+        pass
+
+
+def add(name: str, url: str, key: str = "", models: list[str] | None = None) -> str:
+    """Add or update a provider."""
+    p = {
+        "name": name,
+        "url": url.rstrip("/"),
+        "key": key,
+        "models": models or [],
+    }
+    db.kv_set(_db_key(f"config:{name}"), json.dumps(p))
+    _log.info(f"provider added: {name} → {url}")
+    return f"✓ Provider '{name}' saved ({url})"
+
+
+def set_key(name: str, key: str) -> str:
+    """Set API key for a provider."""
+    p = get_provider(name)
+    p["key"] = key
+    db.kv_set(_db_key(f"config:{name}"), json.dumps(p))
+
+
+    if name == get_active_name():
+        config.LLM_API_KEY = key
+        _invalidate()
+
+    _log.info(f"API key set for: {name}")
+    return f"✓ API key set for {name}"
+
+
+def list_providers() -> list[str]:
+    """List all available provider names (presets + custom)."""
+    names = set(PRESETS.keys())
+
+    custom = db.kv_get_prefix("provider:config:")
+    for k in custom:
+        name = k.replace("provider:config:", "")
+        names.add(name)
+    return sorted(names)
+
+
+def list_all() -> list[dict]:
+    """List all providers with status. Pings local providers in parallel (1s timeout each, cached 30s)."""
+    from concurrent.futures import ThreadPoolExecutor
+    active = get_active_name()
+    names = list_providers()
+
+
+    local_names = [n for n in names if _is_local(n)]
+
+
+    online_map: dict[str, bool] = {}
+    if local_names:
+        with ThreadPoolExecutor(max_workers=len(local_names)) as ex:
+            futures = {n: ex.submit(ping, n, 1.0, True) for n in local_names}
+            for n, f in futures.items():
+                try:
+                    online_map[n] = f.result(timeout=2)
+                except Exception:
+                    online_map[n] = False
+
+    result = []
+    for name in names:
+        p = get_provider(name)
+        is_local = _is_local(name)
+        online = online_map.get(name, False) if is_local else bool(p.get("key"))
+        result.append({
+            "name": name,
+            "display": p.get("name", name),
+            "url": p.get("url", ""),
+            "has_key": bool(p.get("key")) or is_local,
+            "online": online,
+            "local": is_local,
+            "models": p.get("models", []),
+            "active": name == active,
+        })
+    return result
+
+
+def fetch_models(name: str | None = None) -> list[str]:
+    """Fetch available models from provider's /v1/models endpoint."""
+    p = get_provider(name)
+    url = p.get("url", "")
+    key = p.get("key", "")
+
+    if not url:
+        return []
+
+    try:
+        client = OpenAI(base_url=url, api_key=key or "none")
+        response = client.models.list()
+        models = sorted([m.id for m in response.data])
+
+
+        p["models"] = models
+        db.kv_set(_db_key(f"config:{name or get_active_name()}"), json.dumps(p))
+
+        _log.info(f"discovered {len(models)} models from {name or get_active_name()}")
+        return models
+    except Exception as e:
+        _log.warning(f"model discovery failed for {name}: {e}")
+        return p.get("models", [])
+
+
+_CTX_CACHE: dict[tuple[str, str], tuple[int, float]] = {}
+_CTX_TTL = 60.0
+
+
+def detect_context_length(timeout: float = 1.5) -> int:
+    """Auto-detect the active model's context window in tokens.
+
+    Returns 0 if undetectable. Tries:
+      - LM Studio: GET /api/v0/models (native API, richer metadata)
+      - Ollama:    POST /api/show (returns modelfile with num_ctx / context_length)
+      - OpenAI-compatible: no public field, returns 0 (user sets model_context)
+
+    Cached per (provider, model) for 60s.
+    """
+    import time
+    name = get_active_name()
+    model = get_model()
+    key = (name, model)
+    now = time.time()
+    cached = _CTX_CACHE.get(key)
+    if cached and cached[1] > now:
+        return cached[0]
+
+    ctx = 0
+    url = get_url().rstrip("/")
+
+    base = url[:-3].rstrip("/") if url.endswith("/v1") else url
+
+    try:
+        import urllib.request
+        import json as _json
+        if name == "lmstudio" or "1234" in url:
+
+            req = urllib.request.Request(f"{base}/api/v0/models")
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = _json.loads(resp.read().decode("utf-8", errors="replace"))
+            for m in (data.get("data") or []):
+                if m.get("id") == model or m.get("id", "").startswith(model):
+                    ctx = int(m.get("loaded_context_length") or m.get("max_context_length") or 0)
+                    break
+        elif name == "ollama" or "11434" in url:
+
+            req = urllib.request.Request(
+                f"{base}/api/show",
+                data=_json.dumps({"name": model}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = _json.loads(resp.read().decode("utf-8", errors="replace"))
+            mi = data.get("model_info") or {}
+
+            for k, v in mi.items():
+                if k.endswith(".context_length"):
+                    ctx = int(v)
+                    break
+    except Exception as e:
+        _log.debug(f"detect_context_length({name}, {model}): {e}")
+
+    _CTX_CACHE[key] = (ctx, now + _CTX_TTL)
+    return ctx
+
+
+def _init():
+    """Load saved provider state into config module."""
+    active = get_active_name()
+    p = get_provider(active)
+
+    if p.get("url"):
+        config.LLM_BASE_URL = p["url"]
+    if p.get("key"):
+        config.LLM_API_KEY = p["key"]
+
+    saved_model = db.kv_get(_db_key("model"))
+    if saved_model:
+        config.LLM_MODEL = saved_model
+
+
+    tz = db.kv_get("tz_offset")
+    if tz:
+        config.TZ_OFFSET = int(tz)
+
+
+_init()
