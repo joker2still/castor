@@ -1,0 +1,1916 @@
+"""Skill Creator — generates new skills via multi-step background pipeline."""
+
+import ast
+import json
+import os
+import re
+import textwrap
+import threading
+import time
+from pathlib import Path
+
+import db
+import pricing
+import providers as _providers
+
+DESCRIPTION = "Create new skills by describing what they should do"
+
+INSTRUCTION = """When creating skills, you have access to the full agent runtime. Generated skills can call any other tool, save to memory, use the camera, read secrets — anything the agent itself can do.
+
+DATABASE (lazy import inside execute()):
+- db._get_conn() → sqlite3.Connection (thread-local, DO NOT close)
+- db.kv_get(key) → str | None
+- db.kv_set(key, value) → None
+- db.kv_get_prefix(prefix) → dict[str, str]
+- db.kv_inc(key, delta=1) → int
+DON'T use: db.cursor(), db.connect(), db.close(), db.execute(), db.datetime
+
+MEMORY (semantic recall + atomic facts):
+- import memory
+- memory.save(text, tag="user", thread_id=None, synth=True) → point_id
+- memory.search(query, limit=8) → list of dicts with text/tag/score/ts
+
+ANY OTHER AGENT TOOL by name (this is how skills compose):
+- import tools
+- tools.execute("camera_capture", {"prompt": "describe what you see"}) → str
+- tools.execute("http_request", {"url": "...", "method": "GET"}) → str
+- tools.execute("read_file", {"path": "..."}) → str
+- tools.execute("write_file", {"path": "...", "content": "..."}) → str
+- tools.execute("send_file", {"path": "..."}) → str (attaches file to chat)
+- tools.execute("open_url", {"url": "..."}) → str (opens in user's browser)
+- tools.execute("secret_save", {"key": "...", "value": "..."}) → str
+- tools.execute("secret_get", {"key": "..."}) → str
+
+LLM (direct call when needed):
+- import providers
+- client = providers.get_client()
+- resp = client.chat.completions.create(model=providers.get_model(), messages=[...])
+
+CONFIG / SCHEDULER / TASKS (available but rarely needed):
+- import config; config.LLM_MODEL, config.DATA_DIR
+- import scheduler; scheduler.add(name, schedule, prompt) for cron-style
+- import tasks; tasks.register(name, description) for background work
+
+TABLE NAMING (CRITICAL — castor uses ONE shared SQLite for everything):
+- ALWAYS prefix your skill's tables with "skill_<skill_name>_". Example:
+  skill_meal_logger_meals, skill_workout_tracker_sets, skill_slack_notify_webhooks
+- This prevents silent data collisions with other skills (two skills both
+  creating a generic `notes` table would share rows accidentally) and with
+  core agent tables (messages, kv, threads, scheduled_tasks, routine_runs).
+- Do NOT use generic names: notes, logs, tasks, users, items, records.
+- Same rule for kv_set keys when persisting config — prefix with
+  "skill:<skill_name>:" e.g. "skill:meal_logger:daily_target".
+
+ALWAYS:
+- Lazy-import inside execute(): json, datetime, memory, tools, etc. Cheap module load.
+- Create tables with CREATE TABLE IF NOT EXISTS
+- Return strings from execute()
+- Handle errors with try/except → return friendly error string
+
+NEVER:
+- Hardcode API keys / tokens — use secret_save/secret_get
+- Block forever waiting on user input from outside the chat
+- Modify global agent state — keep skill state in own SQLite tables or kv_* keys
+- Use ungrouped table names like 'notes' or 'logs' — collide with other skills"""
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "create_skill",
+            "description": "Generate a new skill module that adds tools to castor. Use this WHENEVER the user asks to connect/integrate/use a service or build a capability that doesn't already exist as a tool — Gmail, Slack, Notion, GitHub, weather APIs, fitness trackers, custom workflows. Do NOT shell-install CLI tools or write loose scripts for these requests; use this tool instead. Runs in background, returns immediately, notifies when ready.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Skill name (lowercase, no spaces, e.g. 'workout_tracker', 'gmail', 'slack_notify')",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Detailed description of what the skill should do — include the service/API name, what tools it should expose, what auth it needs, and example use cases",
+                    },
+                },
+                "required": ["name", "description"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_skill",
+            "description": "Delete a user-created skill by name. Cannot delete built-in skills.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Skill name to delete (e.g. 'health_check')",
+                    },
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_skill_files",
+            "description": "List existing skill files to see examples.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+]
+
+
+SKILL_TEMPLATE = '''{docstring_block}
+DESCRIPTION = {short_description_repr}
+
+INSTRUCTION = {instruction_repr}
+
+TOOLS = {tools_json}
+
+
+def execute(name: str, args: dict) -> str:
+    """Handle tool calls for this skill."""
+    import json
+    from datetime import datetime
+    import db
+
+    conn = db._get_conn()
+
+    # Ensure tables exist
+{table_ddl}
+    conn.commit()
+
+{execute_body}
+
+    return f"Unknown tool: {{name}}"
+'''
+
+
+STEP1_PLAN = """You are a skill architect. Given a skill description, output a JSON plan.
+
+Skills you create run inside the castor agent and can use ALL of its
+capabilities — they are not sandboxed mini-apps. You may compose tools
+that combine:
+
+  - memory.save / memory.search    → persistent semantic recall
+  - tools.execute("camera_capture", ...)   → vision / live frame analysis
+  - tools.execute("http_request", ...)     → call any HTTP API
+  - tools.execute("secret_save"/"secret_get") → persisted API keys / tokens
+  - tools.execute("read_file"/"write_file"/"send_file") → workspace I/O
+  - tools.execute("open_url", ...)         → push a URL to the user's browser
+  - providers.get_client()                  → direct LLM calls when needed
+
+Plan for these when relevant. Examples:
+  "fitness coach" → http_request (wearable API) + memory (goals + history) + LLM (advice)
+  "meal logger"   → camera_capture (food photo) + memory + own SQLite table
+  "slack notify"  → secret_get (webhook) + http_request
+
+Output ONLY valid JSON, no markdown, no explanation:
+{{
+    "docstring": "One-line module description",
+    "short_description": "Short desc (max 80 chars)",
+    "instruction": "When and how to use this skill's tools",
+    "tables": ["skill_<skill_name>_<purpose>: column1 TYPE, column2 TYPE, ..."],
+    "tools": ["tool_name: brief description of what it does"]
+}}
+
+CRITICAL: table names MUST be prefixed with skill_<skill_name>_ to
+avoid collisions with other skills and the core agent tables. Example
+for skill 'meal_logger': "skill_meal_logger_meals" and
+"skill_meal_logger_targets" — never just "meals" or "targets".
+
+Keep it simple. IMPORTANT: Max 3 tools only! Max 2 tables. Fewer = better."""
+
+STEP2_TOOLS = """You are a tool definition generator. Given a plan, output OpenAI function tool definitions as a JSON array.
+
+Output ONLY a valid JSON array, no markdown:
+[
+    {{
+        "type": "function",
+        "function": {{
+            "name": "tool_name",
+            "description": "What it does",
+            "parameters": {{
+                "type": "object",
+                "properties": {{
+                    "param1": {{"type": "string", "description": "..."}},
+                    "param2": {{"type": "integer", "description": "..."}}
+                }},
+                "required": ["param1"]
+            }}
+        }}
+    }}
+]
+
+Rules: snake_case names, clear descriptions, correct JSON types."""
+
+STEP3_CODE = """Generate Python code for a skill's execute() function body.
+
+Variables already available: name (str), args (dict), conn (sqlite3 connection), json, datetime, db.
+
+You may also lazy-import inside any branch:
+    import memory                  # memory.save(text, tag, synth=True), memory.search(query, limit)
+    import tools                   # tools.execute("camera_capture"|"http_request"|"secret_get"|...)
+    import providers               # providers.get_client() for direct LLM calls
+
+Output ONLY the if/elif code block. No markdown. No explanation. No thinking.
+
+Example A — local CRUD (notes):
+
+    if name == "add_note":
+        text = args.get("text", "")
+        conn.execute("INSERT INTO notes (text, created) VALUES (?, ?)", (text, datetime.now().isoformat()))
+        conn.commit()
+        return f"Note saved: {text[:50]}"
+
+    elif name == "list_notes":
+        rows = conn.execute("SELECT id, text, created FROM notes ORDER BY id DESC LIMIT 10").fetchall()
+        if not rows:
+            return "No notes yet."
+        lines = [f"#{r[0]}: {r[1]} ({r[2]})" for r in rows]
+        return "\\n".join(lines)
+
+Example B — camera + memory:
+
+    if name == "describe_scene":
+        import memory, tools
+        result = tools.execute("camera_capture", {"prompt": args.get("prompt", "describe what you see")})
+        memory.save(result, tag="scene_log", synth=True)
+        return result
+
+Example C — secret + http_request:
+
+    elif name == "post_to_slack":
+        import tools
+        webhook = tools.execute("secret_get", {"key": "slack_webhook"})
+        if webhook.startswith("Error") or webhook.startswith("Secret"):
+            return "Slack webhook not configured. Save it via secret_save with key='slack_webhook'."
+        return tools.execute("http_request", {
+            "url": webhook,
+            "method": "POST",
+            "json_body": {"text": args.get("message", "")}
+        })
+
+Example D — search persistent memory:
+
+    elif name == "recall_about_user":
+        import memory
+        topic = args.get("topic", "")
+        hits = memory.search(topic, limit=5)
+        if not hits:
+            return f"No memories matching '{topic}'."
+        return "\\n".join(f"- {h['text'][:120]} ({h.get('tag', '?')})" for h in hits)
+
+Now generate code following these patterns. Use 4-space indent. Each branch returns a string."""
+
+
+def _sanitize_id(name: str) -> str:
+    """Ensure a SQL identifier is safe."""
+    return re.sub(r'[^a-zA-Z0-9_]', '', name) or "col"
+
+
+def _infer_op(tool_name: str, description: str = "") -> str:
+    """Infer operation type from tool name (and optionally description)."""
+    n = tool_name.lower()
+    d = description.lower()
+
+    if any(w in n for w in ("schedule", "cron", "every", "remind", "timer")):
+        return "schedule"
+    if any(w in n for w in ("telegram",)) or ("telegram" in d and any(w in n for w in ("send", "notify"))):
+        return "telegram"
+    if any(w in n for w in ("send", "post", "notify", "webhook", "ping", "alert")):
+        return "http_request"
+    if any(w in n for w in ("read_file", "load_file", "open_file")):
+        return "read_file"
+
+    if any(w in n for w in ("read", "fetch", "load")) and any(w in d for w in ("file", "path", "disk", "local")):
+        return "read_file"
+    if any(w in n for w in ("delete", "remove", "drop")):
+        return "delete"
+    if any(w in n for w in ("update", "edit", "modify", "change")):
+        return "update"
+    if any(w in n for w in ("stats", "count", "summary", "total", "status")):
+        return "stats"
+    if any(w in n for w in ("get", "read", "view", "fetch", "detail")):
+        return "get"
+    if any(w in n for w in ("list", "search", "find", "all", "show", "browse")):
+        return "list"
+    if any(w in n for w in ("add", "create", "new", "insert", "log", "record")):
+        return "add"
+    return "custom"
+
+
+def _t_add(name: str, spec: dict, first: bool) -> str:
+    kw = "if" if first else "elif"
+    table = _sanitize_id(spec.get("table", "items"))
+    cols = spec.get("cols", {})
+    preview = spec.get("preview", next(iter(cols), "item"))
+    lines = [f'    {kw} name == "{name}":']
+    safe_names = {}
+    for c, ctype in cols.items():
+        sc = _sanitize_id(c)
+
+        var = f"v_{sc}" if sc in ("name", "args", "conn") else sc
+        safe_names[c] = var
+        default = '""' if ctype == "string" else "0" if ctype == "integer" else "0.0"
+        lines.append(f'        {var} = args.get("{sc}", {default})')
+    col_list = ", ".join(_sanitize_id(c) for c in cols)
+    placeholders = ", ".join("?" for _ in cols)
+    vals = ", ".join(safe_names[c] for c in cols)
+    lines.append(f'        conn.execute("INSERT INTO {table} ({col_list}) VALUES ({placeholders})", ({vals},))')
+    lines.append(f'        conn.commit()')
+    preview_var = safe_names.get(preview, _sanitize_id(preview))
+    lines.append(f'        return f"Added: {{{preview_var}[:50]}}"')
+    return "\n".join(lines)
+
+
+def _t_list(name: str, spec: dict, first: bool) -> str:
+    kw = "if" if first else "elif"
+    table = _sanitize_id(spec.get("table", "items"))
+    cols = [_sanitize_id(c) for c in spec.get("cols", ["id"])]
+    fmt = spec.get("format", "#{r[0]}")
+    filt = spec.get("filter_col")
+    col_str = ", ".join(cols)
+    lines = [f'    {kw} name == "{name}":']
+    lines.append(f'        limit = args.get("limit", 10)')
+    if filt:
+        filt = _sanitize_id(filt)
+        lines.append(f'        fv = args.get("{filt}")')
+        lines.append(f'        if fv:')
+        lines.append(f'            rows = conn.execute("SELECT {col_str} FROM {table} WHERE {filt} = ? ORDER BY id DESC LIMIT ?", (fv, limit)).fetchall()')
+        lines.append(f'        else:')
+        lines.append(f'            rows = conn.execute("SELECT {col_str} FROM {table} ORDER BY id DESC LIMIT ?", (limit,)).fetchall()')
+    else:
+        lines.append(f'        rows = conn.execute("SELECT {col_str} FROM {table} ORDER BY id DESC LIMIT ?", (limit,)).fetchall()')
+    lines.append(f'        if not rows:')
+    lines.append(f'            return "No items found."')
+    lines.append(f'        out = [f"{fmt}" for r in rows]')
+    lines.append(f'        return "\\n".join(out)')
+    return "\n".join(lines)
+
+
+def _t_delete(name: str, spec: dict, first: bool) -> str:
+    kw = "if" if first else "elif"
+    table = _sanitize_id(spec.get("table", "items"))
+    lines = [f'    {kw} name == "{name}":']
+    lines.append(f'        item_id = args.get("id")')
+    lines.append(f'        if not item_id:')
+    lines.append(f'            return "Error: id is required"')
+    lines.append(f'        conn.execute("DELETE FROM {table} WHERE id = ?", (item_id,))')
+    lines.append(f'        conn.commit()')
+    lines.append(f'        return f"Deleted #{{item_id}}"')
+    return "\n".join(lines)
+
+
+def _t_update(name: str, spec: dict, first: bool) -> str:
+    kw = "if" if first else "elif"
+    table = _sanitize_id(spec.get("table", "items"))
+    ucols = spec.get("update_cols", spec.get("cols", []))
+    if isinstance(ucols, dict):
+        ucols = list(ucols.keys())
+    ucols = [_sanitize_id(c) for c in ucols]
+    lines = [f'    {kw} name == "{name}":']
+    lines.append(f'        item_id = args.get("id")')
+    lines.append(f'        if not item_id:')
+    lines.append(f'            return "Error: id is required"')
+    lines.append(f'        sets, vals = [], []')
+    lines.append(f'        for col in {ucols!r}:')
+    lines.append(f'            v = args.get(col)')
+    lines.append(f'            if v is not None:')
+    lines.append(f'                sets.append(f"{{col}}=?")')
+    lines.append(f'                vals.append(v)')
+    lines.append(f'        if not sets:')
+    lines.append(f'            return "Nothing to update"')
+    lines.append(f'        vals.append(item_id)')
+    lines.append(f'        conn.execute(f"UPDATE {table} SET {{\\",\\".join(sets)}} WHERE id=?", vals)')
+    lines.append(f'        conn.commit()')
+    lines.append(f'        return f"Updated #{{item_id}}"')
+    return "\n".join(lines)
+
+
+def _t_get(name: str, spec: dict, first: bool) -> str:
+    kw = "if" if first else "elif"
+    table = _sanitize_id(spec.get("table", "items"))
+    cols = [_sanitize_id(c) for c in spec.get("cols", ["id"])]
+    fmt = spec.get("format", "#{r[0]}")
+    col_str = ", ".join(cols)
+    lines = [f'    {kw} name == "{name}":']
+    lines.append(f'        item_id = args.get("id")')
+    lines.append(f'        if not item_id:')
+    lines.append(f'            return "Error: id is required"')
+    lines.append(f'        r = conn.execute("SELECT {col_str} FROM {table} WHERE id = ?", (item_id,)).fetchone()')
+    lines.append(f'        if not r:')
+    lines.append(f'            return "Not found"')
+    lines.append(f'        return f"{fmt}"')
+    return "\n".join(lines)
+
+
+def _t_stats(name: str, spec: dict, first: bool) -> str:
+    kw = "if" if first else "elif"
+    table = _sanitize_id(spec.get("table", "items"))
+    label = spec.get("label", "items")
+    lines = [f'    {kw} name == "{name}":']
+    lines.append(f'        count = conn.execute("SELECT COUNT(*) FROM {table}").fetchone()[0]')
+    lines.append(f'        return f"{{count}} {label} total"')
+    return "\n".join(lines)
+
+
+def _t_http_request(name: str, spec: dict, first: bool) -> str:
+    """Template for HTTP request tools — uses actual param names from tool definition."""
+    kw = "if" if first else "elif"
+    url_param = spec.get("url_param", "url")
+    body_params = spec.get("body_params", ["body", "message", "text"])
+    method = spec.get("method", "GET").upper()
+    lines = [f'    {kw} name == "{name}":']
+    lines.append(f'        import urllib.request, urllib.error, json as _json')
+    lines.append(f'        target_url = args.get("{url_param}", "")')
+    lines.append(f'        if not target_url:')
+    lines.append(f'            return "Error: {url_param} is required"')
+
+    if len(body_params) == 1:
+        lines.append(f'        body = args.get("{body_params[0]}", "")')
+    elif body_params:
+
+        gets = ", ".join(f'"{p}": args.get("{p}", "")' for p in body_params)
+        lines.append(f'        body = _json.dumps({{{gets}}})')
+    else:
+        lines.append(f'        body = ""')
+    lines.append(f'        try:')
+    if method == "POST":
+        lines.append(f'            data = body.encode("utf-8") if body else None')
+        lines.append(f'            req = urllib.request.Request(target_url, data=data, method="POST")')
+        lines.append(f'            req.add_header("Content-Type", "application/json")')
+    else:
+        lines.append(f'            req = urllib.request.Request(target_url)')
+    lines.append(f'            req.add_header("User-Agent", "castor/skill")')
+    lines.append(f'            with urllib.request.urlopen(req, timeout=15) as resp:')
+    lines.append(f'                result = resp.read().decode("utf-8")[:2000]')
+    lines.append(f'            return f"OK ({{len(result)}} chars): {{result[:200]}}"')
+    lines.append(f'        except urllib.error.URLError as e:')
+    lines.append(f'            return f"Request failed: {{e}}"')
+    return "\n".join(lines)
+
+
+def _t_read_file(name: str, spec: dict, first: bool) -> str:
+    """Template for file reading tools — uses actual param names from tool definition."""
+    kw = "if" if first else "elif"
+    path_param = spec.get("path_param", "path")
+    extra_params = spec.get("extra_params", [])
+    lines = [f'    {kw} name == "{name}":']
+    lines.append(f'        from pathlib import Path')
+
+    all_paths = [path_param] + extra_params
+    if len(all_paths) > 1:
+        lines.append(f'        results = []')
+        for p in all_paths:
+            lines.append(f'        _{_sanitize_id(p)} = args.get("{p}", "")')
+            lines.append(f'        if _{_sanitize_id(p)}:')
+            lines.append(f'            _p = Path(_{_sanitize_id(p)}).expanduser()')
+            lines.append(f'            if _p.is_file() and _p.stat().st_size <= 1_000_000:')
+            lines.append(f'                try:')
+            lines.append(f'                    results.append(f"[{p}] " + _p.read_text(encoding="utf-8", errors="replace")[:2000])')
+            lines.append(f'                except Exception as e:')
+            lines.append(f'                    results.append(f"[{p}] Error: {{e}}")')
+            lines.append(f'            elif _p.exists():')
+            lines.append(f'                results.append(f"[{p}] Too large or not a file: {{_p}}")')
+            lines.append(f'            else:')
+            lines.append(f'                results.append(f"[{p}] Not found: {{_p}}")')
+        lines.append(f'        if not results:')
+        lines.append(f'            return "Error: no file paths provided"')
+        lines.append(f'        return "\\n".join(results)')
+    else:
+        lines.append(f'        file_path = args.get("{path_param}", "")')
+        lines.append(f'        if not file_path:')
+        lines.append(f'            return "Error: {path_param} is required"')
+        lines.append(f'        p = Path(file_path).expanduser()')
+        lines.append(f'        if not p.exists():')
+        lines.append(f'            return f"File not found: {{p}}"')
+        lines.append(f'        if not p.is_file():')
+        lines.append(f'            return f"Not a file: {{p}}"')
+        lines.append(f'        if p.stat().st_size > 1_000_000:')
+        lines.append(f'            return f"File too large: {{p.stat().st_size}} bytes (max 1MB)"')
+        lines.append(f'        try:')
+        lines.append(f'            text = p.read_text(encoding="utf-8", errors="replace")')
+        lines.append(f'            if len(text) > 4000:')
+        lines.append(f'                text = text[:4000] + f"\\n... ({{len(text)}} chars total, truncated)"')
+        lines.append(f'            return text')
+        lines.append(f'        except Exception as e:')
+        lines.append(f'            return f"Read error: {{e}}"')
+    return "\n".join(lines)
+
+
+def _t_telegram(name: str, spec: dict, first: bool) -> str:
+    """Template for Telegram-sending tools — builds API URL from bot_token + chat_id."""
+    kw = "if" if first else "elif"
+    pm = spec.get("param_map", {})
+    token_p = pm.get("bot_token", "bot_token")
+    chat_p = pm.get("chat_id", "chat_id")
+    text_p = pm.get("text", "message_text")
+    lines = [f'    {kw} name == "{name}":']
+    lines.append(f'        import urllib.request, urllib.error, json as _json')
+    lines.append(f'        bot_token = args.get("{token_p}", "")')
+    lines.append(f'        chat_id = args.get("{chat_p}", "")')
+    lines.append(f'        text = args.get("{text_p}", "")')
+    lines.append(f'        if not bot_token:')
+    lines.append(f'            return "Error: {token_p} is required"')
+    lines.append(f'        if not chat_id:')
+    lines.append(f'            return "Error: {chat_p} is required"')
+    lines.append(f'        if not text:')
+    lines.append(f'            return "Error: {text_p} is required"')
+    lines.append(f'        url = f"https://api.telegram.org/bot{{bot_token}}/sendMessage"')
+    lines.append(f'        payload = _json.dumps({{"chat_id": chat_id, "text": text, "parse_mode": "HTML"}}).encode("utf-8")')
+    lines.append(f'        try:')
+    lines.append(f'            req = urllib.request.Request(url, data=payload, method="POST")')
+    lines.append(f'            req.add_header("Content-Type", "application/json")')
+    lines.append(f'            req.add_header("User-Agent", "castor/skill")')
+    lines.append(f'            with urllib.request.urlopen(req, timeout=15) as resp:')
+    lines.append(f'                result = _json.loads(resp.read().decode("utf-8"))')
+    lines.append(f'            if result.get("ok"):')
+    lines.append(f'                return f"Telegram message sent to chat {{chat_id}}"')
+    lines.append(f'            return f"Telegram API error: {{result}}"')
+    lines.append(f'        except urllib.error.URLError as e:')
+    lines.append(f'            return f"Telegram request failed: {{e}}"')
+    return "\n".join(lines)
+
+
+def _t_schedule(name: str, spec: dict, first: bool) -> str:
+    """Template for scheduling tools — calls scheduler.add() with actual param names."""
+    kw = "if" if first else "elif"
+    pm = spec.get("param_map", {})
+
+    name_p = pm.get("name") or "name"
+    task_p = pm.get("task") or "task"
+    sched_p = pm.get("schedule") or "schedule"
+    lines = [f'    {kw} name == "{name}":']
+    lines.append(f'        import scheduler')
+    lines.append(f'        task_name = args.get("{name_p}", "scheduled_task")')
+    lines.append(f'        task_desc = args.get("{task_p}", "")')
+    lines.append(f'        sched = args.get("{sched_p}", "in 1h")')
+    lines.append(f'        if not task_desc:')
+    lines.append(f'            return "Error: {task_p} is required"')
+    lines.append(f'        result = scheduler.add(task_name, task_desc, sched)')
+    lines.append(f'        if result.get("error"):')
+    lines.append(f'            return f"Schedule failed: {{result[\'error\']}}"')
+    lines.append(f'        return f"Scheduled \'{{task_name}}\': {{sched}} (next: {{result.get(\'next_run\', \'?\')}})"')
+    return "\n".join(lines)
+
+
+_TEMPLATE_BUILDERS = {
+    "add": _t_add, "list": _t_list, "delete": _t_delete,
+    "update": _t_update, "get": _t_get, "stats": _t_stats,
+    "http_request": _t_http_request, "telegram": _t_telegram,
+    "read_file": _t_read_file, "schedule": _t_schedule,
+}
+
+
+def _assemble_from_mapping(mapping: dict) -> tuple:
+    """Assemble execute() body from operation mapping.
+
+    Returns (code_body, has_custom, custom_tool_names).
+    """
+    blocks = []
+    custom_tools = []
+
+    for tool_name, spec in mapping.items():
+        op = spec.get("op", "custom")
+        if op not in _TEMPLATE_BUILDERS and op != "custom":
+            op = _infer_op(tool_name)
+
+        if op == "custom" or op not in _TEMPLATE_BUILDERS:
+            custom_tools.append(tool_name)
+            continue
+
+        block = _TEMPLATE_BUILDERS[op](tool_name, spec, first=len(blocks) == 0)
+        blocks.append(block)
+
+    return "\n\n".join(blocks), bool(custom_tools), custom_tools
+
+
+def _auto_format(cols: list) -> str:
+    """Generate f-string format from column list for display."""
+    if not cols:
+        return "#{r[0]}"
+    parts = []
+    for i, c in enumerate(cols):
+        if i == 0:
+            parts.append(f"#{{r[{i}]}}")
+        elif i == 1:
+            parts.append(f"{{r[{i}]}}")
+        else:
+            parts.append(f"({{r[{i}]}})")
+    return ": ".join(parts[:2]) + (" " + " ".join(parts[2:]) if len(parts) > 2 else "")
+
+
+def _extract_table_cols(plan: dict, table_name: str) -> list:
+    """Parse column names from plan['tables'] entry matching table_name."""
+    for t in plan.get("tables", []):
+        parts = t.split(":")
+        if len(parts) < 2:
+            continue
+        tname = parts[0].strip().split("(")[0].strip()
+        if _sanitize_id(tname) == _sanitize_id(table_name):
+            cols_str = parts[1].strip()
+            cols = []
+            for c in cols_str.split(","):
+                col_name = c.strip().split()[0]
+                col_name = _sanitize_id(col_name)
+                if col_name and col_name.lower() not in ("id", "created_at"):
+                    cols.append(col_name)
+            return cols
+    return []
+
+
+def _has_telegram_params(props: dict) -> bool:
+    """Check if tool parameters look like Telegram API params (bot_token + chat_id)."""
+    names = {p.lower() for p in props}
+    has_token = any(w in n for n in names for w in ("bot_token", "token"))
+    has_chat = any(w in n for n in names for w in ("chat_id", "chat"))
+    return has_token and has_chat
+
+
+def _map_telegram_params(props: dict) -> dict:
+    """Map actual parameter names to telegram template roles."""
+    token_p = next((p for p in props if any(w in p.lower() for w in ("bot_token", "token"))), "bot_token")
+    chat_p = next((p for p in props if any(w in p.lower() for w in ("chat_id", "chat"))), "chat_id")
+    text_p = next((p for p in props if any(w in p.lower() for w in ("message", "text", "body", "content")) and "token" not in p.lower() and "chat" not in p.lower()), "message_text")
+    return {"bot_token": token_p, "chat_id": chat_p, "text": text_p}
+
+
+def _build_mapping_from_tools(tools_list: list, plan: dict) -> dict:
+    """Build operation mapping deterministically from tool definitions and plan.
+
+    No LLM call — uses tool names, parameter definitions, and table info from plan.
+    """
+
+    tables = []
+    for t in plan.get("tables", []):
+        tname = t.split(":")[0].strip().split("(")[0].strip()
+        tname = _sanitize_id(tname)
+        if tname:
+            tables.append(tname)
+    default_table = tables[0] if tables else "items"
+
+    mapping = {}
+    for tool in tools_list:
+        func = tool.get("function", {})
+        tool_name = func.get("name", "")
+        if not tool_name:
+            continue
+        props = func.get("parameters", {}).get("properties", {})
+
+        tool_desc = func.get("description", "")
+        op = _infer_op(tool_name, tool_desc)
+
+
+        if op == "http_request" and _has_telegram_params(props):
+            op = "telegram"
+        if op in ("http_request", "telegram", "read_file", "schedule"):
+            spec = {"op": op, "params": list(props.keys())}
+            if op == "telegram":
+                spec["param_map"] = _map_telegram_params(props)
+            elif op == "http_request":
+
+                url_param = next((p for p in props if any(w in p.lower() for w in ("url", "endpoint", "webhook", "target", "link"))), None)
+                if not url_param:
+                    url_param = next((p for p, s in props.items() if s.get("type") == "string"), "url")
+                spec["url_param"] = url_param
+
+                body_params = [p for p in props if p != url_param]
+                spec["body_params"] = body_params
+                if any(w in tool_name for w in ("post", "send", "notify", "webhook")):
+                    spec["method"] = "POST"
+            elif op == "read_file":
+
+                path_param = next((p for p in props if any(w in p.lower() for w in ("path", "file", "filename", "location"))), None)
+                if not path_param:
+                    path_param = next(iter(props), "path")
+                spec["path_param"] = path_param
+
+                spec["extra_params"] = [p for p in props if p != path_param]
+            elif op == "schedule":
+
+                spec["param_map"] = {
+                    "name": next((p for p in props if any(w in p.lower() for w in ("name", "label", "title", "job"))), None),
+                    "task": next((p for p in props if any(w in p.lower() for w in ("task", "desc", "command", "message", "action"))), None),
+                    "schedule": next((p for p in props if any(w in p.lower() for w in ("schedule", "time", "interval", "cron", "every", "when"))), None),
+                }
+            mapping[tool_name] = spec
+            continue
+
+
+        table = default_table
+        for t in tables:
+
+            stem = t.rstrip("s")
+            if stem and stem in tool_name:
+                table = t
+                break
+
+
+        cols = {}
+        for pname, pspec in props.items():
+            if pname in ("id", "limit"):
+                continue
+            ptype = pspec.get("type", "string")
+            cols[pname] = ptype
+
+        spec = {"op": op, "table": table}
+
+        if op == "add":
+            spec["cols"] = cols
+            first_str = next((c for c, t in cols.items() if t == "string"), next(iter(cols), None))
+            if first_str:
+                spec["preview"] = first_str
+
+        elif op == "list":
+            plan_cols = _extract_table_cols(plan, table)
+            list_cols = ["id"] + (plan_cols if plan_cols else [_sanitize_id(c) for c in cols])
+            spec["cols"] = list_cols
+            spec["format"] = _auto_format(list_cols)
+            filter_cols = [c for c in cols if cols[c] == "string"]
+            if filter_cols:
+                spec["filter_col"] = filter_cols[0]
+
+        elif op == "update":
+            spec["update_cols"] = [_sanitize_id(c) for c in cols]
+
+        elif op == "stats":
+            spec["label"] = table
+
+        elif op == "get":
+            plan_cols = _extract_table_cols(plan, table)
+            get_cols = ["id"] + (plan_cols[:4] if plan_cols else [_sanitize_id(c) for c in cols])
+            spec["cols"] = get_cols
+            spec["format"] = _auto_format(get_cols)
+
+        mapping[tool_name] = spec
+
+    return mapping
+
+
+def _build_table_ddl(plan: dict) -> str:
+    """Build CREATE TABLE DDL from plan, fixing duplicate id/created_at columns."""
+    ddl_lines = []
+    for table_spec in plan.get("tables", []):
+        spec = table_spec.strip()
+        if spec.upper().startswith("CREATE TABLE"):
+            ddl_lines.append(f'    conn.execute("""{spec}""")')
+        elif ":" in spec:
+            tname, cols = spec.split(":", 1)
+            tname = _sanitize_id(tname.strip())
+            parts = [c.strip() for c in cols.strip().split(",")]
+
+            parts = [c for c in parts if c
+                     and not re.match(r'^id\b', c, re.IGNORECASE)
+                     and not re.match(r'^created_at\b', c, re.IGNORECASE)]
+
+            quoted = []
+            for p in parts:
+                tokens = p.strip().split(None, 1)
+                if len(tokens) == 2:
+                    quoted.append(f'"{tokens[0]}" {tokens[1]}')
+                elif tokens:
+                    quoted.append(f'"{tokens[0]}" TEXT')
+            cols_clean = ", ".join(quoted)
+            if cols_clean:
+                ddl_lines.append(
+                    f'    conn.execute("""CREATE TABLE IF NOT EXISTS {tname} (\n'
+                    f'        id INTEGER PRIMARY KEY AUTOINCREMENT,\n'
+                    f'        {cols_clean},\n'
+                    f'        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP\n'
+                    f'    )""")')
+            else:
+                ddl_lines.append(
+                    f'    conn.execute("""CREATE TABLE IF NOT EXISTS {tname} (\n'
+                    f'        id INTEGER PRIMARY KEY AUTOINCREMENT,\n'
+                    f'        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP\n'
+                    f'    )""")')
+        elif "(" in spec:
+            match = re.match(r'(\w+)\s*\((.+)\)', spec)
+            if match:
+                tname, cols = match.group(1), match.group(2).strip()
+                ddl_lines.append(
+                    f'    conn.execute("""CREATE TABLE IF NOT EXISTS {tname} ({cols})""")')
+    return "\n".join(ddl_lines) if ddl_lines else "    pass  # No tables needed"
+
+
+_active_skills: set = set()
+_active_lock = threading.Lock()
+
+
+def execute(name: str, args: dict) -> str:
+    if name == "create_skill":
+        return _create_skill_async(args["name"], args["description"])
+    elif name == "delete_skill":
+        return _delete_skill(args["name"])
+    elif name == "list_skill_files":
+        return _list_skills()
+    return f"Unknown tool: {name}"
+
+
+def _delete_skill(skill_name: str) -> str:
+    """Delete a user-created skill. Refuses to delete built-in skills."""
+    import config
+    from skills import disable
+
+    skill_name = skill_name.lower().replace(" ", "_").replace("-", "_")
+    if not skill_name.isidentifier():
+        return f"Error: '{skill_name}' is not a valid skill name"
+
+
+    user_dir = config.USER_SKILLS_DIR
+    target = user_dir / f"{skill_name}.py"
+
+
+    builtin_dir = Path(__file__).parent
+    if (builtin_dir / f"{skill_name}.py").exists():
+        return f"Error: '{skill_name}' is a built-in skill and cannot be deleted"
+
+    if not target.exists():
+        return f"Error: skill '{skill_name}' not found in {user_dir}"
+
+    dropped_tables = _drop_skill_owned_tables(skill_name, target)
+
+
+    disable(skill_name)
+
+
+    target.unlink()
+
+
+    pycache = user_dir / "__pycache__"
+    if pycache.exists():
+        for cached in pycache.glob(f"skill_{skill_name}*"):
+            cached.unlink(missing_ok=True)
+        for cached in pycache.glob(f"{skill_name}*"):
+            cached.unlink(missing_ok=True)
+
+    if dropped_tables:
+        return f"Deleted skill '{skill_name}' ({dropped_tables} skill table(s) dropped)"
+    return f"Deleted skill '{skill_name}'"
+
+
+def _drop_skill_owned_tables(skill_name: str, skill_path: Path) -> int:
+    """Drop SQLite tables declared by this skill's own namespaced DDL."""
+    try:
+        source = skill_path.read_text(encoding="utf-8")
+        tables = _extract_skill_owned_tables(source, skill_name)
+        if not tables:
+            return 0
+
+        import db
+
+        conn = db._get_conn()
+        dropped = 0
+        for table in tables:
+            exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (table,),
+            ).fetchone()
+            if not exists:
+                continue
+            conn.execute(f'DROP TABLE IF EXISTS "{table}"')
+            dropped += 1
+        if dropped:
+            conn.commit()
+        return dropped
+    except Exception as e:
+        import logger
+
+        logger.get("skill_creator").warning(
+            f"failed to clean tables for {skill_name}: {e}"
+        )
+        return 0
+
+
+def _extract_skill_owned_tables(source: str, skill_name: str) -> list[str]:
+    """Return safe table names with the skill_<skill_name>_ prefix."""
+    prefix = f"skill_{skill_name}_"
+    pattern = re.compile(
+        r"CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+[`\"'\[]?"
+        r"([A-Za-z_][A-Za-z0-9_]*)"
+        r"[`\"'\]]?",
+        re.IGNORECASE,
+    )
+    tables = {
+        table
+        for table in pattern.findall(source)
+        if table.startswith(prefix) and table.isidentifier()
+    }
+    return sorted(tables)
+
+
+def _create_skill_async(skill_name: str, description: str) -> str:
+    """Kick off background skill generation."""
+    import logger
+    _log = logger.get("skill_creator")
+
+
+    try:
+        import telemetry as _tel
+        _tel.track_feature_first_use("skill_create")
+    except Exception:
+        pass
+
+    skill_name = skill_name.lower().replace(" ", "_").replace("-", "_")
+    if not skill_name.isidentifier():
+        return f"Error: '{skill_name}' is not a valid Python identifier"
+
+
+    with _active_lock:
+        if skill_name in _active_skills:
+            return f"Skill '{skill_name}' is already being generated. Please wait."
+        _active_skills.add(skill_name)
+
+    import config
+    skills_dir = config.USER_SKILLS_DIR
+    target = skills_dir / f"{skill_name}.py"
+    if target.exists():
+        with _active_lock:
+            _active_skills.discard(skill_name)
+        return f"Error: skill '{skill_name}' already exists at {target}"
+
+
+    import tasks
+    task_id = tasks.register(f"skill:{skill_name}", f"Creating skill '{skill_name}': {description[:100]}")
+
+
+    t = threading.Thread(
+        target=_generate_skill_pipeline,
+        args=(skill_name, description, target, task_id),
+        daemon=True,
+    )
+    t.start()
+    _log.info(f"skill generation started in background: {skill_name} (task #{task_id})")
+
+    return (
+        f"⏳ Skill '{skill_name}' generation started in background.\n"
+        f"I'll work through: plan → tools → code → validate.\n"
+        f"This takes 2-5 minutes. I'll notify when done."
+    )
+
+
+def _llm_call(system: str, user: str, _tok_accum: list | None = None) -> str:
+    """Make a single LLM call. No client-side token cap — let the model
+    use whatever the provider's context allows. Earlier flat caps
+    (2048) silently truncated step-3 mid-string on skills with 3+
+    custom tools, leaving unterminated literals the syntax-validator
+    couldn't repair. The provider's own model max is the only ceiling.
+
+    If *_tok_accum* is a list, appends a (in_tok, out_tok) tuple so callers
+    can aggregate token counts across multiple calls without changing the
+    return type.
+    """
+    import providers
+    client = providers.get_client()
+    model = providers.get_model()
+
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        temperature=0.2,
+    )
+    if _tok_accum is not None and getattr(resp, "usage", None):
+        _tok_accum.append((
+            int(getattr(resp.usage, "prompt_tokens", 0) or 0),
+            int(getattr(resp.usage, "completion_tokens", 0) or 0),
+        ))
+    raw = resp.choices[0].message.content or ""
+
+    raw = re.sub(r"<think>.*?</think>\s*", "", raw, flags=re.DOTALL).strip()
+    return raw
+
+
+def _docstring_block(text: str) -> str:
+    '''Render `text` as a safe triple-quoted module docstring.
+
+    User-controlled strings landing inside a triple-quoted block can
+    break the rendered .py if they contain three consecutive double-
+    quotes (premature termination) or end with a backslash (escapes
+    the closing quote). Escape both, then wrap.
+    '''
+    text = text.replace('"""', r'\"\"\"')
+
+
+    trailing = len(text) - len(text.rstrip("\\"))
+    if trailing % 2 == 1:
+        text = text + "\\"
+    return f'"""{text}"""\n'
+
+
+def _tools_to_python_literal(tools_list: list) -> str:
+    """Render a JSON-shaped tools list as a Python literal.
+
+    `json.dumps` produces `true`/`false`/`null` — embedding that verbatim
+    in a `.py` template gives bare identifier names that Python's AST
+    parses but `import` rejects with NameError. `pprint.pformat` with
+    `sort_dicts=False` preserves insertion order and emits `True`/
+    `False`/`None`, so the rendered module is both syntactically valid
+    AND runtime-importable.
+    """
+    import pprint
+    return pprint.pformat(tools_list, indent=4, width=100, sort_dicts=False)
+
+
+def _extract_json(raw: str):
+    """Extract JSON from LLM output, handling markdown fences and thinking text."""
+
+    raw = re.sub(r"<think>.*?</think>\s*", "", raw, flags=re.DOTALL).strip()
+
+
+    if "```" in raw:
+        lines = raw.split("\n")
+        clean = []
+        in_fence = False
+        for line in lines:
+            if line.strip().startswith("```"):
+                in_fence = not in_fence
+                continue
+            if in_fence or not clean:
+                clean.append(line)
+        raw = "\n".join(clean).strip()
+
+
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+
+    for i in range(len(raw) - 1, -1, -1):
+        if raw[i] in ('}', ']'):
+            opener = '{' if raw[i] == '}' else '['
+            depth = 0
+            for j in range(i, -1, -1):
+                if raw[j] == raw[i]:
+                    depth += 1
+                elif raw[j] == opener:
+                    depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(raw[j:i + 1])
+                    except (json.JSONDecodeError, ValueError):
+                        break
+
+            break
+
+
+    try:
+        from agent import _repair_json
+        return _repair_json(raw)
+    except Exception:
+        pass
+
+    return None
+
+
+def _extract_code(raw: str) -> str:
+    """Extract Python code from LLM output."""
+
+    raw = re.sub(r"<think>.*?</think>\s*", "", raw, flags=re.DOTALL).strip()
+
+
+    lines = raw.split("\n")
+    code_start = None
+    _name_branch_re = re.compile(r'^\s*(?:if\s*\(?\s*name\s*==|match\s+name\s*:)')
+    for i, line in enumerate(lines):
+        if _name_branch_re.match(line):
+            code_start = i
+            break
+
+        if line.strip().startswith("```"):
+            continue
+
+    if code_start is not None:
+
+        code_lines = []
+        in_fence = False
+        for line in lines[code_start:]:
+            if line.strip().startswith("```"):
+                in_fence = not in_fence
+                continue
+            code_lines.append(line)
+        return "\n".join(code_lines)
+
+
+    if "```" in raw:
+        clean = []
+        in_fence = False
+        for line in lines:
+            if line.strip().startswith("```"):
+                in_fence = not in_fence
+                continue
+            if in_fence:
+                clean.append(line)
+        if clean:
+            return "\n".join(clean)
+
+    return raw.strip()
+
+
+def _fix_indentation(code: str) -> str:
+    """Fix indentation by detecting the offset and normalizing to 4-space base.
+
+    Strategy: find the first `if name ==` line, measure its indent,
+    then shift ALL lines so that line sits at exactly 4 spaces.
+    Preserves relative indentation within blocks.
+    """
+    lines = code.split("\n")
+
+
+    anchor_indent = None
+    for line in lines:
+        stripped = line.lstrip()
+        if stripped.startswith("if name ==") or stripped.startswith("if name=="):
+            anchor_indent = len(line) - len(stripped)
+            break
+
+    if anchor_indent is None:
+
+        fixed = []
+        for line in lines:
+            if not line.strip():
+                fixed.append("")
+                continue
+            current = len(line) - len(line.lstrip())
+            if current < 4:
+                fixed.append("    " + line.lstrip())
+            else:
+                fixed.append(line)
+        return "\n".join(fixed)
+
+
+    shift = 4 - anchor_indent
+    fixed = []
+    for line in lines:
+        if not line.strip():
+            fixed.append("")
+            continue
+        current = len(line) - len(line.lstrip())
+        new_indent = max(4, current + shift)
+        fixed.append(" " * new_indent + line.lstrip())
+
+    return "\n".join(fixed)
+
+
+def _fix_elif_body_indent(code: str) -> str:
+    """Fix the LLM anti-pattern where elif/if branch bodies are at the elif's own indent.
+
+    Local models often emit:
+
+        elif name == "x":
+            pass                  ← _fix_empty_blocks added this (body was empty)
+        real_code()               ← at elif_indent, NOT inside the branch
+        return "result"           ← at elif_indent — breaks the if/elif chain
+
+        elif name == "y":         ← SyntaxError: elif after non-if statements
+
+    This function detects that pattern (elif/if followed by pass + body at wrong
+    indent) and re-indents the real body to be INSIDE the branch (+4).
+    """
+    lines = code.split("\n")
+    out: list[str] = []
+    i = 0
+
+
+    _branch_re = re.compile(r'^( *)(el)?if\s+name\s*==\s*.+:\s*$')
+
+    while i < len(lines):
+        line = lines[i]
+        m = _branch_re.match(line)
+        if not m:
+            out.append(line)
+            i += 1
+            continue
+
+        elif_indent = len(m.group(1))
+        body_indent = elif_indent + 4
+
+
+        j = i + 1
+        while j < len(lines) and not lines[j].strip():
+            j += 1
+
+        # Must be `pass` at body_indent
+        if not (j < len(lines)
+                and lines[j].strip() == "pass"
+                and len(lines[j]) - len(lines[j].lstrip()) == body_indent):
+            out.append(line)
+            i += 1
+            continue
+
+
+        k = j + 1
+        while k < len(lines) and not lines[k].strip():
+            k += 1
+
+        if k >= len(lines):
+            out.append(line)
+            i += 1
+            continue
+
+        after_indent = len(lines[k]) - len(lines[k].lstrip())
+
+
+        is_at_same_level = (after_indent == elif_indent)
+        is_new_branch = bool(_branch_re.match(lines[k]))
+        if not (is_at_same_level and not is_new_branch):
+            out.append(line)
+            i += 1
+            continue
+
+
+        out.append(line)
+
+        for b in range(i + 1, j):
+            out.append(lines[b])
+
+        i = k
+
+
+        while i < len(lines):
+            curr = lines[i]
+            curr_stripped = curr.strip()
+            if not curr_stripped:
+                out.append(curr)
+                i += 1
+                continue
+            curr_indent = len(curr) - len(curr.lstrip())
+
+
+            if curr_indent == elif_indent:
+                if _branch_re.match(curr) or curr_stripped.rstrip() == "else:":
+                    break
+
+            out.append(" " * (curr_indent + 4) + curr_stripped)
+            i += 1
+
+
+    return "\n".join(out)
+
+
+def _is_name_dispatch_if(node: ast.AST) -> bool:
+    """``if name == "...": ...`` (any constant on the right) — the
+    dispatch shape used in skill execute() bodies."""
+    if not isinstance(node, ast.If):
+        return False
+    test = node.test
+    if not isinstance(test, ast.Compare):
+        return False
+    if len(test.ops) != 1 or not isinstance(test.ops[0], ast.Eq):
+        return False
+    return (
+        isinstance(test.left, ast.Name)
+        and test.left.id == "name"
+        and len(test.comparators) == 1
+        and isinstance(test.comparators[0], ast.Constant)
+    )
+
+
+def _last_in_elif_chain(node: ast.If) -> ast.If:
+    """Walk ``orelse`` through chained elifs, return the innermost If."""
+    cur = node
+    while (
+        len(cur.orelse) == 1
+        and isinstance(cur.orelse[0], ast.If)
+        and _is_name_dispatch_if(cur.orelse[0])
+    ):
+        cur = cur.orelse[0]
+    return cur
+
+
+def _body_is_only_pass(if_node: ast.If) -> bool:
+    """Body is ``[Pass]`` — the stub marker the LLM left behind."""
+    return len(if_node.body) == 1 and isinstance(if_node.body[0], ast.Pass)
+
+
+def _fix_stub_branch_outside_code(code: str) -> str:
+    """Pull stray top-level statements into the preceding stub-Pass branch.
+
+    The LLM anti-pattern (issue #14, observed in workspace_meter +
+    camera_diagnostics field sessions):
+
+        elif name == "camera_benchmark":
+            pass                              # <- stub, not real impl
+        import time, tools                    # <- at function-body indent
+        samples = int(args.get("samples"))    # <- meant for the branch above
+        ...
+        return f"benchmark complete"
+
+    The line-based ``_fix_elif_body_indent`` covers the common shape.
+    This AST pass handles the remainder: blank lines or comments
+    between Pass and the stray code, tab/space mixing, chained
+    elif/else, and the case where the stray code spans across what
+    the LLM thought was one branch's implementation.
+
+    Algorithm:
+      1. Wrap input as a fake function body so ``ast.parse`` accepts it.
+      2. Walk top-level statements. For each dispatch ``If`` (``name == "..."``)
+         with body=[Pass], pull all following non-dispatch siblings into
+         that branch's body (replacing the Pass).
+      3. For chained ``elif``: descend into the last If in the chain;
+         the stray code following the OUTER If logically belongs to
+         the inner-most stub branch.
+      4. Re-emit via ``ast.unparse``.
+
+    Safety:
+      * If ``ast.parse`` fails (LLM emitted truly broken code), return
+        the input unchanged — let the next pipeline step error.
+      * If nothing changes, return the original string (preserves
+        LLM's formatting / comments via the regex pass).
+    """
+    if not code or not code.strip():
+        return code
+
+
+    wrapped = "def __sk_fake__(name, args):\n" + textwrap.indent(code, "    ")
+    try:
+        tree = ast.parse(wrapped)
+    except SyntaxError:
+        return code
+
+    if not (tree.body and isinstance(tree.body[0], ast.FunctionDef)):
+        return code
+    func = tree.body[0]
+
+    new_body: list[ast.stmt] = []
+    body = func.body
+    changed = False
+    i = 0
+    while i < len(body):
+        stmt = body[i]
+        if _is_name_dispatch_if(stmt):
+            tail = _last_in_elif_chain(stmt)
+            if _body_is_only_pass(tail):
+
+                pulled: list[ast.stmt] = []
+                j = i + 1
+                while j < len(body):
+                    nxt = body[j]
+                    if _is_name_dispatch_if(nxt):
+                        break
+                    pulled.append(nxt)
+                    j += 1
+                if pulled:
+                    tail.body = pulled
+                    new_body.append(stmt)
+                    i = j
+                    changed = True
+                    continue
+        new_body.append(stmt)
+        i += 1
+
+    if not changed:
+        return code
+
+    func.body = new_body
+    try:
+        out = ast.unparse(tree)
+    except Exception:
+        return code
+
+    out_lines = out.split("\n")
+    if out_lines and out_lines[0].startswith("def __sk_fake__"):
+        out_lines = out_lines[1:]
+    return textwrap.dedent("\n".join(out_lines))
+
+
+def _fix_empty_blocks(code: str) -> str:
+    """Add 'pass' after empty if/elif/else/try/except blocks."""
+    lines = code.split("\n")
+    fixed = []
+    for i, line in enumerate(lines):
+        fixed.append(line)
+        stripped = line.rstrip()
+        if stripped.endswith(":"):
+
+            current_indent = len(line) - len(line.lstrip())
+            next_indent = None
+            for j in range(i + 1, min(i + 3, len(lines))):
+                next_stripped = lines[j].strip()
+                if next_stripped:
+                    next_indent = len(lines[j]) - len(lines[j].lstrip())
+                    break
+            if next_indent is not None and next_indent <= current_indent:
+                fixed.append(" " * (current_indent + 4) + "pass")
+    return "\n".join(fixed)
+
+
+def _save_skill_result(skill_name: str, description: str, tool_names: list, success: bool):
+    """Save skill creation result to memory + chat history so the model knows about it."""
+    try:
+        import memory
+        if success:
+            tools_str = ", ".join(tool_names) if tool_names else "none"
+            text = (
+                f"Skill '{skill_name}' created successfully. "
+                f"Description: {description}. "
+                f"Available tools: {tools_str}. "
+                f"User can use /{skill_name} to interact with it."
+            )
+        else:
+            text = f"Skill '{skill_name}' creation failed. Description was: {description}. User may want to retry."
+        memory.save(text, tag="task")
+    except Exception:
+        pass
+
+
+    try:
+        import db
+        status = "✅" if success else "❌"
+        if success:
+            tools_str = ", ".join(tool_names) if tool_names else ""
+            chat_msg = f"{status} Skill '{skill_name}' ready! Tools: {tools_str}. Use /{skill_name}."
+        else:
+            chat_msg = f"{status} Skill '{skill_name}' creation failed. Try with a simpler description."
+        db.save_message("assistant", chat_msg, meta={"source": "skill_creator"})
+    except Exception:
+        pass
+
+
+def _notify(skill_name: str, message: str):
+    """Send notification about skill generation progress."""
+    import logger
+    _log = logger.get("skill_creator")
+    _log.info(f"[{skill_name}] {message}")
+
+
+    try:
+        import sys
+        if "server" in sys.modules:
+            import asyncio
+            server = sys.modules["server"]
+            ws_loop = getattr(server, "_ws_loop", None)
+            ws_clients = getattr(server, "_ws_clients", None)
+            broadcast = getattr(server, "_broadcast", None)
+            if ws_loop and ws_clients and broadcast:
+                asyncio.run_coroutine_threadsafe(
+                    broadcast({"type": "task_update", "name": skill_name, "text": message}),
+                    ws_loop
+                )
+    except Exception as e:
+        _log.debug(f"[{skill_name}] WS notify failed: {e}")
+
+
+    try:
+        import telegram_bot
+        if telegram_bot.is_verified() and telegram_bot._running:
+            owner = telegram_bot.get_owner_id()
+            if owner:
+                telegram_bot.send_message(owner, f"🔧 Skill '{skill_name}': {message}")
+    except Exception:
+        pass
+
+
+def _cleanup_debug_logs(logs_dir: Path, keep: int = 5):
+    """Remove old skill_debug_* files, keeping only the most recent."""
+    debug_files = sorted(logs_dir.glob("skill_debug_*.py"), key=lambda f: f.stat().st_mtime)
+    for f in debug_files[:-keep]:
+        try:
+            f.unlink()
+        except OSError:
+            pass
+
+
+def _smoke_test(skill_path: Path, tools_list: list[dict]) -> list[str]:
+    """Try importing the skill and calling execute() with empty args for each tool.
+
+    Also verifies that required parameters from tool definitions are actually
+    referenced in the generated execute() code (catches definition/implementation mismatch).
+    Returns list of error strings (empty = OK).
+    """
+    errors = []
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(f"_smoke_{skill_path.stem}", skill_path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+    except Exception as e:
+        return [f"Import failed: {e}"]
+
+
+    try:
+        source = skill_path.read_text(encoding="utf-8")
+    except Exception:
+        source = ""
+
+
+    execute_body_source = _extract_execute_body(source)
+
+    for t in tools_list:
+        func = t.get("function", {})
+        tool_name = func.get("name", "")
+        if not tool_name:
+            continue
+
+
+        try:
+            result = mod.execute(tool_name, {})
+            if not isinstance(result, str):
+                errors.append(f"{tool_name}: execute() returned {type(result).__name__}, expected str")
+        except Exception as e:
+            err_str = str(e)
+
+
+            if "NOT NULL" in err_str or "required" in err_str.lower() or "missing" in err_str.lower():
+                pass
+            else:
+                errors.append(f"{tool_name}: {e}")
+
+        # 2. Param-usage check: every required param must appear in execute() source
+        if execute_body_source:
+            required = func.get("parameters", {}).get("required", [])
+            for param in required:
+
+                if f'"{param}"' not in execute_body_source and f"'{param}'" not in execute_body_source:
+                    errors.append(
+                        f'{tool_name}: required param "{param}" not found in execute() code — '
+                        f'definition/implementation mismatch'
+                    )
+
+    return errors
+
+
+def _extract_execute_body(source: str) -> str:
+    """Return the source text of the execute() function body only.
+
+    Uses AST to find the FunctionDef for 'execute' and extracts the
+    raw source spanning its body. Returns empty string on any failure
+    (unparseable source, no execute function, etc.) so callers degrade
+    gracefully to no check rather than crashing.
+    """
+    if not source:
+        return ""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return ""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "execute":
+
+            first = node.body[0]
+            last = node.body[-1]
+            lines = source.splitlines(keepends=True)
+
+            start_line = first.lineno - 1
+            end_line = last.end_lineno
+            return "".join(lines[start_line:end_line])
+    return ""
+
+
+def _generate_skill_pipeline(skill_name: str, description: str, target: Path, task_id: int = 0):
+    """Multi-step skill generation pipeline running in background."""
+    try:
+        _run_pipeline(skill_name, description, target, task_id)
+    finally:
+        with _active_lock:
+            _active_skills.discard(skill_name)
+
+
+def _emit_pipeline_telemetry(outcome: str, attempts: int, start_time: float,
+                              tools_count: int) -> None:
+    """Emit a `skill_creator_pipeline` telemetry event. No-op when disabled.
+
+    Privacy: outcome / attempts / duration / tools-count only. Never the
+    skill name (could be a corp identifier) or any tool names.
+    """
+    try:
+        import telemetry
+        if not telemetry.enabled():
+            return
+        kind = outcome if outcome in telemetry.PIPELINE_OUTCOMES else "max_attempts_exhausted"
+        telemetry.track_event("skill_creator_pipeline", {
+            "outcome": kind,
+            "attempts": int(attempts),
+            "duration_ms": int((time.time() - start_time) * 1000),
+            "tools_count": int(tools_count),
+        })
+    except Exception:
+        # Telemetry must never crash the skill pipeline
+        pass
+
+
+def _run_pipeline(skill_name: str, description: str, target: Path, task_id: int = 0):
+    """Actual pipeline logic, wrapped by _generate_skill_pipeline for cleanup."""
+    import logger
+    import tasks
+    _log = logger.get("skill_creator")
+    start = time.time()
+    max_attempts = 3
+
+
+    last_failure: str = "max_attempts_exhausted"
+
+
+    last_error_hint: str = ""
+
+
+    _sc_thread_id = f"skill:{skill_name}"
+    _rid = db.insert_agent_run(
+        thread_id=_sc_thread_id, source="skill_creator",
+        started_at=start, status="running",
+        model=_providers.get_model(), provider=_providers.get_active_name(),
+    )
+    _tok_accum: list = []
+
+    _run_state: dict = {"status": "ok", "error": None, "preview": None}
+
+    def _finalize_run():
+        """Write final metrics to agent_runs. Called at every exit point."""
+        _finished = time.time()
+        agg_in = sum(t[0] for t in _tok_accum)
+        agg_out = sum(t[1] for t in _tok_accum)
+        _cost = None
+        try:
+            _cost = pricing.compute_cost(_providers.get_model(), agg_in, agg_out)
+        except Exception:
+            pass
+        db.finalize_agent_run(
+            _rid, finished_at=_finished,
+            duration_ms=int((_finished - start) * 1000),
+            status=_run_state["status"], error=_run_state["error"],
+            result_preview=_run_state["preview"],
+            input_tokens=agg_in, output_tokens=agg_out,
+            cost_usd=_cost,
+        )
+
+
+    def _progress(step: str):
+        if task_id:
+            tasks.update(task_id, "running", step)
+        _notify(skill_name, step)
+
+    for attempt in range(1, max_attempts + 1):
+        _log.info(f"[{skill_name}] attempt {attempt}/{max_attempts}")
+
+        try:
+
+            _progress(f"Step 1/5: planning (attempt {attempt})")
+            _log.info(f"[{skill_name}] step 1: planning")
+            user_prompt = f"Create a skill called '{skill_name}'.\nDescription: {description}"
+            if last_error_hint:
+                user_prompt += (
+                    f"\n\nThe previous attempt failed with: {last_error_hint}\n"
+                    f"Adjust the plan to avoid this error."
+                )
+            plan_raw = _llm_call(STEP1_PLAN, user_prompt, _tok_accum=_tok_accum)
+            plan = _extract_json(plan_raw)
+            if not plan or not isinstance(plan, dict):
+                _log.warning(f"[{skill_name}] step 1 failed: bad JSON")
+                last_error_hint = "step1 produced unparseable JSON for the plan"
+                continue
+
+            _log.info(f"[{skill_name}] step 1 done: {len(plan.get('tools', []))} tools planned")
+
+
+            _progress(f"Step 2/5: generating tools (attempt {attempt})")
+            _log.info(f"[{skill_name}] step 2: generating tool definitions")
+            tools_raw = _llm_call(
+                STEP2_TOOLS,
+                f"Skill: {skill_name}\nPlan:\n{json.dumps(plan, indent=2, ensure_ascii=False)}",
+                _tok_accum=_tok_accum,
+            )
+            tools_list = _extract_json(tools_raw)
+            if not tools_list or not isinstance(tools_list, list):
+                _log.warning(f"[{skill_name}] step 2 failed: bad tools JSON")
+                last_error_hint = "step2 produced unparseable JSON for tool definitions"
+                continue
+
+
+            valid_tools = []
+            for t in tools_list:
+                if isinstance(t, dict) and t.get("function", {}).get("name"):
+                    if "type" not in t:
+                        t["type"] = "function"
+                    valid_tools.append(t)
+            if not valid_tools:
+                _log.warning(f"[{skill_name}] step 2: no valid tools")
+                last_error_hint = "step2 produced no tools with a valid function.name"
+                continue
+            tools_list = valid_tools
+
+            _log.info(f"[{skill_name}] step 2 done: {len(tools_list)} tools")
+
+
+            _progress(f"Step 3/5: assembling code (attempt {attempt})")
+            _log.info(f"[{skill_name}] step 3: building mapping from tool definitions")
+            tool_names = [t["function"]["name"] for t in tools_list]
+            tables_info = "\n".join(plan.get("tables", []))
+
+            mapping = _build_mapping_from_tools(tools_list, plan)
+            execute_body, has_custom, custom_tools = _assemble_from_mapping(mapping)
+            _log.info(f"[{skill_name}] step 3: assembled {len(mapping) - len(custom_tools)} tools from templates")
+
+            if has_custom and custom_tools:
+
+                _log.info(f"[{skill_name}] step 3: {len(custom_tools)} custom tools need LLM: {custom_tools}")
+                tool_descriptions = "\n".join(
+                    f"- {t['function']['name']}: {t['function'].get('description', '')}"
+                    for t in tools_list
+                )
+
+
+                first_keyword = "if" if not execute_body else "elif"
+                custom_prompt = (
+                    f"Skill: {skill_name}\n"
+                    f"Tables (already created):\n{tables_info}\n\n"
+                    f"Generate Python branches for these tools:\n"
+                    + "\n".join(f"- {tn}" for tn in custom_tools)
+                    + f"\n\nDescriptions:\n{tool_descriptions}\n"
+                    f"Start the FIRST tool with '{first_keyword} name == \"...\":' "
+                    f"and the rest with 'elif name == \"...\":'. Each branch "
+                    f"contains the FULL implementation (no stub `pass`) and "
+                    f"returns a string. All code for a tool MUST be indented "
+                    f"under its branch — no top-level statements between branches."
+                )
+                custom_raw = _llm_call(STEP3_CODE, custom_prompt, _tok_accum=_tok_accum)
+                custom_code = _extract_code(custom_raw)
+                custom_code = _fix_indentation(custom_code)
+                custom_code = _fix_empty_blocks(custom_code)
+                custom_code = _fix_elif_body_indent(custom_code)
+
+
+                custom_code = _fix_stub_branch_outside_code(custom_code)
+
+
+                if not execute_body:
+                    custom_code = re.sub(
+                        r'^(\s*)elif(\s+name\s*==)',
+                        r'\1if\2',
+                        custom_code, count=1, flags=re.MULTILINE,
+                    )
+                execute_body = execute_body + "\n\n" + custom_code if execute_body else custom_code
+
+
+            _progress(f"Step 4/5: building tables (attempt {attempt})")
+            table_ddl = _build_table_ddl(plan)
+
+
+            _progress(f"Step 5/5: validating (attempt {attempt})")
+            _log.info(f"[{skill_name}] step 5: assembling and validating")
+
+
+            tools_json = _tools_to_python_literal(tools_list)
+
+
+            docstring_block = _docstring_block(
+                plan.get("docstring") or f"{skill_name} skill")
+            short_desc_repr = repr(
+                plan.get("short_description") or description[:80])
+            instruction_repr = repr(
+                plan.get("instruction") or f"Use {skill_name} tools as needed.")
+
+            code = SKILL_TEMPLATE.format(
+                docstring_block=docstring_block,
+                short_description_repr=short_desc_repr,
+                instruction_repr=instruction_repr,
+                tools_json=tools_json,
+                table_ddl=table_ddl,
+                execute_body=execute_body,
+            )
+
+
+            logs_dir = Path(__file__).parent.parent / "logs"
+            logs_dir.mkdir(exist_ok=True)
+            debug_path = logs_dir / f"skill_debug_{skill_name}_{attempt}.py"
+            debug_path.write_text(code, encoding="utf-8")
+            _cleanup_debug_logs(logs_dir, keep=5)
+
+
+            try:
+                ast.parse(code)
+            except SyntaxError as e:
+                _log.warning(f"[{skill_name}] syntax error on attempt {attempt}: {e}")
+
+
+                execute_body = _fix_empty_blocks(execute_body)
+                execute_body = _fix_elif_body_indent(execute_body)
+                execute_body = _fix_stub_branch_outside_code(execute_body)
+                code = SKILL_TEMPLATE.format(
+                    docstring_block=docstring_block,
+                    short_description_repr=short_desc_repr,
+                    instruction_repr=instruction_repr,
+                    tools_json=tools_json,
+                    table_ddl=table_ddl,
+                    execute_body=execute_body,
+                )
+                try:
+                    ast.parse(code)
+                except SyntaxError as e2:
+                    _log.warning(f"[{skill_name}] still syntax error after fix: {e2}")
+                    last_failure = "syntax_error"
+                    last_error_hint = f"step5_syntax: {e2}"
+                    continue
+
+
+            import tempfile
+            from skills import validate_skill, enable
+            target.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp_path_str = tempfile.mkstemp(
+                suffix=".py",
+                prefix=f"__qwepartial__{skill_name}__",
+                dir=str(target.parent),
+            )
+            tmp_path = Path(tmp_path_str)
+            os.close(fd)
+            try:
+                tmp_path.write_text(code, encoding="utf-8")
+                valid, errors = validate_skill(str(tmp_path))
+                if valid:
+                    os.replace(str(tmp_path), str(target))
+            finally:
+                if tmp_path.exists():
+                    try:
+                        tmp_path.unlink()
+                    except OSError:
+                        pass
+
+            if not valid:
+                _log.warning(f"[{skill_name}] validation errors: {errors}")
+                if attempt < max_attempts:
+                    last_failure = "validate_fail"
+                    last_error_hint = f"validate_fail: {'; '.join(errors)[:200]}"
+                    continue
+
+
+                target.write_text(code, encoding="utf-8")
+                msg = f"⚠️ Created with errors: {'; '.join(errors)}. Fix with write_file."
+                if task_id:
+                    tasks.update(task_id, "error", msg)
+                _notify(skill_name, msg)
+                _emit_pipeline_telemetry("validate_fail", attempt, start, 0)
+                _run_state["status"] = "err"; _run_state["error"] = "validate_fail"
+                _finalize_run()
+                return
+
+
+            smoke_errors = _smoke_test(target, tools_list)
+            if smoke_errors:
+                _log.warning(f"[{skill_name}] smoke test errors: {smoke_errors}")
+                if attempt < max_attempts:
+                    target.unlink(missing_ok=True)
+                    last_failure = "smoke_fail"
+                    last_error_hint = f"smoke_fail: {'; '.join(smoke_errors)[:200]}"
+                    continue
+                msg = f"⚠️ Created but smoke test failed: {'; '.join(smoke_errors)}"
+                if task_id:
+                    tasks.update(task_id, "error", msg)
+                _notify(skill_name, msg)
+                _emit_pipeline_telemetry("smoke_fail", attempt, start, 0)
+                _run_state["status"] = "err"; _run_state["error"] = "smoke_fail"
+                _finalize_run()
+                return
+
+
+            enable(skill_name)
+
+            elapsed = int(time.time() - start)
+            tool_names = [t["function"]["name"] for t in tools_list]
+            msg = f"✅ Created and enabled! ({len(tools_list)} tools, {elapsed}s)"
+            if task_id:
+                tasks.update(task_id, "done", msg)
+            _notify(skill_name, msg)
+            _save_skill_result(skill_name, description, tool_names, success=True)
+            _log.info(f"[{skill_name}] SUCCESS in {elapsed}s, attempt {attempt}")
+            _emit_pipeline_telemetry("success", attempt, start, len(tools_list))
+            _run_state["status"] = "ok"
+            _run_state["preview"] = f"created skill: {skill_name} ({len(tools_list)} tools)"
+            _finalize_run()
+            return
+
+        except Exception as e:
+            _log.error(f"[{skill_name}] attempt {attempt} error: {e}", exc_info=True)
+            last_failure = "max_attempts_exhausted"
+            last_error_hint = f"unexpected exception: {type(e).__name__}: {e}"[:300]
+            _run_state["status"] = "err"; _run_state["error"] = str(e)[:500]
+            continue
+
+
+    elapsed = int(time.time() - start)
+    msg = f"❌ Failed after {max_attempts} attempts ({elapsed}s). Try simpler description."
+    if task_id:
+        tasks.update(task_id, "error", msg)
+    _notify(skill_name, msg)
+    _save_skill_result(skill_name, description, [], success=False)
+    _log.error(f"[{skill_name}] FAILED after {max_attempts} attempts")
+    _emit_pipeline_telemetry(last_failure, max_attempts, start, 0)
+    _finalize_run()
+
+
+def _list_skills() -> str:
+    from pathlib import Path
+    import config
+
+    files = set()
+    for d in (Path(__file__).parent, config.USER_SKILLS_DIR):
+        if d.exists():
+            files.update(f.name for f in d.glob("*.py") if not f.name.startswith("_"))
+    if not files:
+        return "No skills found."
+    return "Existing skills:\n" + "\n".join(f"  - {f}" for f in sorted(files))
