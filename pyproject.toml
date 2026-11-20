@@ -34,7 +34,7 @@ dependencies = [
     "markdownify>=1.2.2",
     "beautifulsoup4>=4.15.0",
     "pdfminer.six>=20240706",
-    "yt-dlp>=2026.3.17",
+    "yt-dlp>=2026.10.26",
     "pyserial>=3.5",
 ]
 
